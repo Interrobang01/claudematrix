@@ -45,7 +45,29 @@ export type IncomingMessage = {
   isHuman: boolean;
   mentionsUs: boolean;
   attachments: { name: string; mxc: string; size: number }[];
+  /** Set when this event is part of a thread: the thread root's event id.
+   *  Absent for a top-level message. This is the only thing the transport
+   *  needs to know about threads; everything else about the message is the
+   *  same shape either way. */
+  threadRootId?: string;
 };
+
+/** The relation that puts an event in a thread.
+ *
+ *  `is_falling_back: true` says the `m.in_reply_to` inside is a *rendering*
+ *  fallback for clients that do not understand threads, not a claim that this
+ *  message answers that specific event. A genuine reply sets it false and
+ *  points at what it actually answers. */
+function threadRelation(rootId: string, replyTo?: string): Record<string, any> {
+  return {
+    "m.relates_to": {
+      rel_type: "m.thread",
+      event_id: rootId,
+      is_falling_back: !replyTo,
+      "m.in_reply_to": { event_id: replyTo ?? rootId },
+    },
+  };
+}
 
 // --- Markdown -> Matrix HTML ---
 
@@ -156,9 +178,13 @@ export class MatrixTransport {
         const humans = this.humansByRoom.get(roomId);
         const senderName = await this.shortName(event.sender);
 
+        const rel = event.content?.["m.relates_to"];
+        const threadRootId = rel?.rel_type === "m.thread" ? rel.event_id : undefined;
+
         handler({
           id: event.event_id,
           roomId,
+          threadRootId,
           sender: event.sender,
           senderName,
           content: isFile ? "" : body,
@@ -187,18 +213,23 @@ export class MatrixTransport {
     return new RegExp(`(^|\\s)@?${escapeRegex(this.userId.split(":")[0].slice(1))}\\b`, "i").test(body);
   }
 
-  room(roomId: string): Room {
+  /** `threadRootId` puts everything this Room sends inside that thread. Absent,
+   *  it sends at the top level, which is what every caller did before threads. */
+  room(roomId: string, threadRootId?: string): Room {
     return {
       id: roomId,
       send: async (content) => {
         const text = typeof content === "string" ? content : content.content;
-        const eventId = await this.client.sendMessage(roomId, messageBody(text));
-        return this.msg(roomId, eventId);
+        const inner = messageBody(text);
+        const eventId = threadRootId
+          ? await this.client.sendEvent(roomId, "m.room.message", { ...inner, ...threadRelation(threadRootId) })
+          : await this.client.sendMessage(roomId, inner);
+        return this.msg(roomId, eventId, threadRootId);
       },
     };
   }
 
-  msg(roomId: string, eventId: string): Msg {
+  msg(roomId: string, eventId: string, threadRootId?: string): Msg {
     return {
       id: eventId,
       roomId,
@@ -215,9 +246,11 @@ export class MatrixTransport {
         const inner = messageBody(text);
         const id = await this.client.sendEvent(roomId, "m.room.message", {
           ...inner,
-          "m.relates_to": { "m.in_reply_to": { event_id: eventId } },
+          ...(threadRootId
+            ? threadRelation(threadRootId, eventId)
+            : { "m.relates_to": { "m.in_reply_to": { event_id: eventId } } }),
         });
-        return this.msg(roomId, id);
+        return this.msg(roomId, id, threadRootId);
       },
       delete: async () => { await this.client.redactEvent(roomId, eventId); },
     };

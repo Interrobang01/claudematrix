@@ -645,6 +645,13 @@ type ChannelConfig = {
    *  tool that becomes available later cannot appear in a turn by surprise; and a
    *  flag rather than a deny rule, so the schema stays out of the prompt too. */
   disallowedTools?: string[];
+  /** Start a thread on every top-level message here, so each exchange gets its
+   *  own bounded session. Off by default, which leaves the room behaving exactly
+   *  as it did: threads are then opt-in, and Terry starts one by hand when he
+   *  wants a fresh context. A message *inside* a thread gets its own session
+   *  either way — that does not need enabling, because it cannot happen by
+   *  accident. */
+  replyInThread?: boolean;
   /** Passed to the CLI as --max-budget-usd, which aborts a turn mid-flight. */
   maxCostUsdPerTurn?: number;
   /** Refuse new turns in this channel once the day's spend reaches this. */
@@ -757,9 +764,16 @@ function getChannelAgent(channelId: string): ChannelConfig | null {
 // Which row a turn's session lives under. Channels sharing a `sessionGroup` share
 // one session: an agent working in the commons can ask for a confirmation on its
 // private channel and the same session sees the answer, which is what keeps the
-// private channel meaningful instead of merely quieter. Threads always get their
-// own session — grouping is about rooms, not about spawned side-conversations.
-function sessionKey(roomId: string, agent: ChannelConfig | null): string {
+// private channel meaningful instead of merely quieter.
+//
+// A thread overrides the group and gets a session of its own. That is the point
+// of threading a conversation — a bounded context you clear by starting another
+// one — but note what it costs: a thread lives in exactly one room, so an
+// exchange threaded in the commons can no longer ask for confirmation in the
+// agent's private room and see the answer. Top-level traffic keeps the group and
+// keeps that property. Thread deliberately.
+function sessionKey(roomId: string, agent: ChannelConfig | null, threadRootId?: string): string {
+  if (threadRootId) return `thread:${threadRootId}`;
   return agent?.sessionGroup ? `group:${agent.sessionGroup}` : roomId;
 }
 
@@ -930,11 +944,10 @@ const TEXT_COMMANDS = [
 
 // --- Text commands ---
 
-async function handleCommand(msg: IncomingMessage, room: Room): Promise<boolean> {
+async function handleCommand(msg: IncomingMessage, room: Room, threadId: string): Promise<boolean> {
   const [cmd, ...rest] = msg.content.trim().split(/\s+/);
   const arg = rest.join(" ").trim();
   const agent = getChannelAgent(msg.roomId);
-  const threadId = sessionKey(msg.roomId, agent);
 
   switch (cmd) {
     case "!help":
@@ -1196,11 +1209,15 @@ transport.onMessage(async (msg) => {
       return;
     }
 
-    const room = transport.room(msg.roomId);
+    // Where a notice or a command answer belongs: exactly where it was typed.
+    // A command must never *start* a thread — `!new` at the top level is about
+    // the room's own session, not about opening a side-conversation.
+    const inThread = msg.threadRootId;
+    const room = transport.room(msg.roomId, inThread);
 
     // Commands are free: no turn, no spend, no budget.
     if (msg.isHuman && msg.content.trim().startsWith("!")) {
-      if (await handleCommand(msg, room)) return;
+      if (await handleCommand(msg, room, sessionKey(msg.roomId, agent, inThread))) return;
     }
 
     if (!consumeBotTurnBudget(msg.roomId, fromBot, agent)) return;
@@ -1217,12 +1234,20 @@ transport.onMessage(async (msg) => {
     const content = msg.content.trim();
     if (!content && msg.attachments.length === 0) return;
 
-    const threadId = sessionKey(msg.roomId, agent);
+    // A message already in a thread stays there. A top-level message opens one
+    // only where the room asks for it.
+    const outThread = inThread ?? ((agent?.replyInThread ?? false) ? msg.id : undefined);
+    const turnRoom = outThread === inThread ? room : transport.room(msg.roomId, outThread);
+
+    const threadId = sessionKey(msg.roomId, agent, outThread);
     const agentCwd = agent?.workingDirectory ?? channelConfig.defaults?.workingDirectory ?? DEFAULT_CWD;
     const agentModel = agent?.model ?? channelConfig.defaults?.model ?? "opus";
 
+    // Only a room-level session may be seeded from the configured `sessionId`.
+    // Seeding a thread with it would make every new thread resume the one
+    // long-lived session it was supposed to be an escape from.
     const entry = agent
-      ? getOrCreate(threadMap, threadId, agentCwd, agent.sessionId)
+      ? getOrCreate(threadMap, threadId, agentCwd, outThread ? undefined : agent.sessionId)
       : getOrCreate(threadMap, threadId, DEFAULT_CWD);
     if (agent) { entry.cwd = agentCwd; entry.model = agentModel; }
 
@@ -1266,13 +1291,13 @@ transport.onMessage(async (msg) => {
     }
 
     await runTurn({
-      room,
+      room: turnRoom,
       roomId: msg.roomId,
       threadId,
       entry,
       agent,
       prompt: history ? `${history}${userMessage}` : userMessage,
-      replyTo: transport.msg(msg.roomId, msg.id),
+      replyTo: transport.msg(msg.roomId, msg.id, outThread),
       filePaths,
     });
   } catch (err) {
@@ -1310,7 +1335,7 @@ process.on("SIGTERM", shutdown);
   console.log(
     configured.length
       ? `[matrix-cc-bot] ${configured.length} room(s): ` + configured
-          .map(([rid, c]) => `${c.name}=${rid}${c.sessionGroup ? ` group:${c.sessionGroup}` : ""}${c.requireMention ? " mention" : ""}${c.allowBots ? " bots" : ""}${c.fetchHistory === false ? " nohistory" : ""}${c.disallowedTools?.length ? ` -${c.disallowedTools.length}tools` : ""}`)
+          .map(([rid, c]) => `${c.name}=${rid}${c.sessionGroup ? ` group:${c.sessionGroup}` : ""}${c.requireMention ? " mention" : ""}${c.allowBots ? " bots" : ""}${c.fetchHistory === false ? " nohistory" : ""}${c.replyInThread ? " thread" : ""}${c.disallowedTools?.length ? ` -${c.disallowedTools.length}tools` : ""}`)
           .join(", ")
       : "[matrix-cc-bot] no channel-config.json — mention-only with defaults",
   );
