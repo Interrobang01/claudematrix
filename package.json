@@ -16,12 +16,12 @@
     "better-sqlite3": "^12.8.0",
     "marked": "^18.0.11",
     "matrix-bot-sdk": "^0.8.0",
-    "node-cron": "^4.2.1"
+    "node-cron": "^4.2.1",
+    "tsx": "^4.19.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node-cron": "^3.0.11",
-    "tsx": "^4.19.0",
     "typescript": "^5.9.2"
   },
   "description": "A Matrix bot that gives each room its own Claude Code session, and lets agents in different rooms address each other."
