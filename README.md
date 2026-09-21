@@ -1,204 +1,123 @@
-# claudecord
+# claudematrix
 
-A Discord bot that bridges Discord channels and threads to [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI sessions. Single file TypeScript, minimal dependencies.
+A Matrix bot that gives each room its own [Claude Code](https://docs.anthropic.com/en/docs/claude-code) session, and lets agents in different rooms address each other. Two TypeScript files and a transport, minimal dependencies.
 
-Drop claudecord into a Discord server and every channel can become its own Claude Code agent — own working directory, own model, own system prompt, own persistent session. You can @-mention it in any thread for one-off help, or configure dedicated channels where every message is a turn in a long-running Claude Code conversation. Schedule agents to post daily briefings on cron. Send file attachments. Stream live previews while Claude is thinking.
+A Node process holds one `/sync` connection and spawns **one `claude -p` per message** in that room's working directory, streaming a live preview while the turn runs and posting the final assistant message verbatim. There is no reply tool and no persistent interactive session: what the model writes is what the room sees.
+
+Originally [ecmulli/claudecord](https://github.com/ecmulli/claudecord), a Discord bot, which is where the `channel` vocabulary in older configs comes from.
 
 ## Features
 
-- **Channel routing** — map Discord channel IDs to Claude Code agents via `channel-config.json` (hot-reloaded). Each channel has its own cwd, model, system prompt, and context file.
-- **Thread sessions** — @mention the bot in any thread for a spawn-on-demand agent with `--resume` persistence.
-- **Scheduled jobs** — cron-based agents that post to a channel on a schedule (great for daily digests).
-- **File attachments** — images, code, PDFs, or any file — auto-downloaded and passed to Claude Code's Read tool.
-- **Streaming preview** — real-time response preview with tool-use status line while Claude is working.
-- **Interactive permission buttons** — AskUserQuestion prompts rendered as Discord buttons.
-- **Multi-bot channels** — several instances can share a channel, route to each other by name, and be stopped from looping.
-- **Spend ceilings** — per-turn and per-day dollar caps.
-- **SQLite storage** — crash-safe session persistence with WAL mode.
-- **Slash commands** — `/new`, `/model`, `/cd`, `/stop`, `/channels`, `/reload-config`, `/sessions`, `/help`.
+- **Room routing** — map Matrix room IDs to agents in `room-config.json` (hot-reloaded). Each room has its own cwd, model, system prompt, tool denials, spend ceiling and persistent session.
+- **Thread sessions** — a threaded conversation gets its own session, so clearing context is starting a new thread rather than running a command.
+- **Sibling addressing** — an agent reaches another by writing `<name>...</name>`. In a shared room that is a wake signal; from a private room the block is forwarded into the shared room and the answer is routed back to the thread that asked. See [Addressing](#addressing).
+- **`[Name]` prefixes** — who spoke is a prefix, who a message is for is a tag, and the two are never merged.
+- **`humans`** — Matrix has no bot flag, so an explicit MXID list per room is the whole distinction. It is also the only thing that can answer a confirmation.
+- **Confirmations** — `AskUserQuestion` renders as a numbered list and blocks the session until somebody on the `humans` list answers.
+- **NO_RESPONSE** — a turn may decline to post anything, which is how an exchange ends gracefully.
+- **Spend ceilings** — per-turn (`--max-budget-usd`) and per-day dollar caps, charged to the room the conversation lives in.
+- **Attachments** — `mxc://` media downloaded and handed to Claude Code as files.
+- **Scheduled jobs** — cron agents that post into a room on a schedule.
+- **SQLite storage** — WAL, crash-safe session and bridge persistence.
+- **Commands** — `!help`, `!new`, `!model`, `!cd`, `!stop`, `!sessions`, `!rooms`, `!reload-config`.
 
-## Quick Start
+## Quick start
 
 ```bash
-git clone https://github.com/ecmulli/claudecord.git
-cd claudecord
+git clone https://github.com/Interrobang01/claudematrix.git
+cd claudematrix
 npm install
 
-# Copy templates
-cp .env.example .env
-cp channel-config.example.json channel-config.json
-cp contexts/general.example.md contexts/general.md
-
-# Edit .env (add DISCORD_TOKEN) and channel-config.json (add real channel IDs)
-# Then:
+cp .env.example .env                              # homeserver URL + access token
+cp room-config.example.json room-config.json      # real room IDs
 npm start
 ```
 
 ### Prerequisites
 
 - Node.js 22+ (uses `--env-file`)
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
-- A Discord bot token ([Discord Developer Portal](https://discord.com/developers/applications))
-- A C++ compiler toolchain for `better-sqlite3` (Xcode CLT on macOS, `build-essential` on Linux)
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code), installed and authenticated
+- A Matrix account for the bot, and its access token
+- `better-sqlite3` installs from a prebuild on common platforms; otherwise a C++ toolchain
 
-### Discord bot setup
+`claude -p` spends a Claude subscription. Harnesses built on `@anthropic-ai/claude-agent-sdk` draw the capped Agent-SDK credit bucket instead, which is a different thing to run out of.
 
-1. Create an application in the Discord Developer Portal.
-2. Go to **Bot** → enable **Message Content Intent**.
-3. Go to **OAuth2 → URL Generator** → select `bot` + `applications.commands`.
-4. Bot permissions: Send Messages, Read Message History, Attach Files, Use Slash Commands, Create Public Threads, Send Messages in Threads.
-5. Use the generated URL to invite the bot to your server.
+## Addressing
+
+An agent addresses somebody by wrapping what it wants them to read in a tag named after them:
+
+```
+on it.
+
+<emet>survey the July changelogs and leave a summary in /srv/emet-share</emet>
+```
+
+The tag names the **addressee**. Who *wrote* a message is the `[Name]` prefix the gateway puts on it, and the two are kept apart on purpose: a tag is a routing label written by whoever wrote the message, and it is not evidence of anything.
+
+In a room both parties are already in, the tag is only a wake signal — it routes the message the way a mention does. A room with `relayRoom` set also **forwards** the block into that room, which is how an agent reaches a sibling who is not here:
+
+1. You and `oman` are talking in `oman`'s own room, in a thread.
+2. `oman` writes `<emet>…</emet>`. The block — and only the block, never the rest of the turn — is posted into the shared room, and a row in the `bridge` table remembers which thread it came from.
+3. `emet` is in the shared room. The tag wakes it, its reply opens a thread on the relayed message, and it answers with `<oman>…</oman>`.
+4. `oman`'s gateway recognises the thread, posts `emet`'s answer into the original thread labelled `[Emet]`, and runs the next turn in **that** session.
+
+Nobody joins anything. The shared room is the only room both accounts are in, which on a homeserver where agents are power level 0 and `invite` is 100 is the only room either of them *can* post into — so it is also, for free, the one room where every message between agents is visible.
+
+Only the tagged block crosses. A turn written for a human is full of context meant for that human; what reaches another agent is exactly what was wrapped.
+
+### What it does not do
+
+An addressed agent is not sandboxed by the tag. It reads everything in the room it is in, as any Matrix member does, and threads are not an access-control boundary — they are a relation on events. The scoping here is that **the block is the only thing forwarded**, not that the recipient is confined.
+
+`<b>`, `<code>` and the rest of the HTML element names are excluded, so ordinary markup is not mistaken for addressing. A tag inside a code fence is left alone.
 
 ## Environment variables
 
 | Variable | Required | Description |
 |---|---|---|
-| `DISCORD_TOKEN` | Yes | Bot token from the Discord Developer Portal. |
-| `GUILD_ID` | No | Server ID for instant slash command registration. Without it, global commands take up to 1 hour to propagate. |
-| `DEFAULT_CWD` | No | Default working directory for Claude Code (defaults to `process.cwd()`). |
-| `CLAUDE_BIN` | No | Path to Claude Code binary (defaults to `claude`). |
+| `MATRIX_HOMESERVER_URL` | Yes | The homeserver's client API. Use the address the bot can reach directly; a public hostname routes your agents through whatever is in front of it. |
+| `MATRIX_ACCESS_TOKEN` | Yes | Access token for the bot's account. |
+| `DEFAULT_CWD` | No | Working directory for rooms with no configured one. |
+| `CLAUDE_BIN` | No | Path to the `claude` binary. Defaults to `claude` on `PATH`. |
+| `MATRIX_STORAGE` | No | Where the `/sync` token is kept. Defaults to `./matrix-sync.json`. |
+| `SILENT_TOKEN` | No | The literal a turn emits to post nothing. Defaults to `NO_RESPONSE`. |
 
-## Channel configuration
+## Room config
 
-Two modes coexist:
+`room-config.json`, hot-reloaded on save, gitignored. `channel-config.json` is still read if that is what is on disk, and `channels` / `configuredChannelsOnly` still load as key names; the startup line says which file was used.
 
-1. **Thread mode** (default) — anywhere the bot is @mentioned in a thread, it spawns a fresh Claude Code session for that thread.
-2. **Channel mode** — any channel listed in `channel-config.json` becomes a dedicated agent. Every message is a turn; the bot replies without needing a mention.
-
-A minimal `channel-config.json`:
-
-```json
-{
-  "channels": {
-    "1234567890123456789": {
-      "name": "general",
-      "sessionId": "general-001",
-      "systemPrompt": "You are a helpful assistant...",
-      "workingDirectory": "/path/to/project",
-      "model": "sonnet",
-      "replyInThread": true,
-      "contextFile": "contexts/general.md"
-    }
-  }
-}
-```
-
-See `channel-config.example.json` for the full schema, including scheduled jobs.
-
-### Channel options
-
-| Key | Default | What |
-|---|---|---|
-| `sessionId` | — | Seeds the channel's first Claude Code session. **Must be a valid UUID** — the CLI rejects anything else. A bad value is warned about at startup. |
-| `systemPrompt` | — | Extra system prompt for this channel. |
-| `systemPromptMode` | `append` | `append` adds to Claude Code's own system prompt (`--append-system-prompt`); `replace` discards it (`--system-prompt`). |
-| `sessionGroup` | — | Channels sharing a group share one Claude Code session, so a conversation can move between rooms without starting over. Give them the same `sessionId` too. Threads spawned from a grouped channel still get their own session. |
-| `requireMention` | `false` | Answer only when mentioned, instead of on every message. |
-| `mentionPatterns` | — | Case-insensitive regexes also counted as a mention. A bot posting plain `@name` produces no Discord ping — only the `<@id>` form does — so text-level matching is what makes name-based routing work between bots. |
-| `allowBots` | `false` | Admit messages from other bots. Also switches on speaker labelling: each message reaches the model as `[Name] text`. |
-| `botTurnBudget` | `6` | Consecutive bot-triggered turns allowed before the channel goes quiet until a human speaks. |
-| `fetchHistory` | `true` | Prepend recent channel messages to the prompt. History filters only *this* bot's own messages, so in a channel shared with other bots it pulls their traffic in whether or not this agent was addressed — turn it off there. |
-| `replyInThread` | `false` | Open a thread per message. Costs a second Claude call (Haiku) to title the thread. |
-| `disallowedTools` | — | Tool names withheld via `--disallowed-tools`. By name rather than by allowlist, so a tool authenticated later cannot appear by surprise; as a flag rather than a deny rule, so the schema stays out of the prompt as well. A rule matching no known tool only warns, so a typo silently grants what it meant to withhold. |
-| `maxCostUsdPerTurn` | — | Passed to the CLI as `--max-budget-usd`; aborts a turn mid-flight. |
-| `maxCostUsdPerDay` | — | Refuse new turns in this channel once the day's spend reaches this. Tracked in memory, so a restart forgives the day. |
-
-### Top-level options
-
-| Key | Default | What |
-|---|---|---|
-| `configuredChannelsOnly` | `false` | Ignore mentions in channels with no entry in `channels`. Left false, a mention anywhere the bot can see starts a turn with `DEFAULT_CWD`, the generic system prompt, and none of that channel's tool denials or budgets — set it true wherever the channel list is meant to be a boundary. |
-
-### Channels shared by several bots
-
-`allowBots: true` is what lets two instances hold a conversation, and therefore
-also what lets them answer each other indefinitely. Three things bound it:
-
-- **`requireMention` + `mentionPatterns`** — an instance only wakes when named,
-  so a turn that names nobody is the end of the exchange.
-- **`NO_RESPONSE`** — a final message beginning with the token (configurable via
-  `SILENT_TOKEN`) posts nothing at all. The graceful exit.
-- **`botTurnBudget`** — the mechanical ceiling, because the first two are
-  instructions and the observed runaway is two agents being *polite* at each
-  other rather than either one misbehaving. Any human message clears the count.
-
-Turns are serialized per session and queue rather than being rejected, up to
-`MAX_QUEUE_DEPTH` (4); scheduled jobs take the same lane.
-
-### Per-channel context files
-
-`contexts/*.md` files get inlined into the system prompt for their channel. Use them to set a persona, list tools the agent should know about, or describe the channel's purpose. Context files are hot-reloaded. Templates live in `contexts/*.example.md`.
-
-### Scheduled agents
-
-Add a `schedule` block to any channel config to run it on a cron. See `contexts/email-triage.example.md` for a fully worked example: a daily 8am email-triage agent that scans, labels, and posts a briefing.
-
-## Running with pm2 (recommended)
-
-pm2 keeps the bot alive across crashes and reboots.
-
-```bash
-npm install -g pm2
-
-pm2 start ecosystem.config.cjs
-pm2 restart claudecord      # After code/config changes
-pm2 stop claudecord
-pm2 logs claudecord
-pm2 status
-
-# Survive reboots
-pm2 startup                 # Follow the printed instructions
-pm2 save
-```
-
-### Troubleshooting
-
-```bash
-# Node version mismatch after Node upgrade
-npm rebuild better-sqlite3
-pm2 restart claudecord
-
-# Duplicate instances (double messages)
-pkill -f "node --import=tsx src/index.ts"
-pm2 restart claudecord
-
-# Crash logs
-pm2 logs claudecord --err --lines 20
-```
-
-## Architecture
-
-```
-Discord channel/thread     claudecord                 Claude Code CLI
-─────────────────────     ──────────                 ───────────────
-message  ───────────►     route by channel ID
-                          fetch recent context
-                          build prompt
-                          spawn claude -p ─────────►  --session-id UUID
-                                                      (or --resume UUID)
-         ◄───────────     stream stdout back    ◄──── stream-json output
-reply / .txt attachment
-```
-
-Single-file architecture: `src/index.ts` (~1500 LOC). Session state lives in a SQLite DB (`threads.db` with WAL mode) mapping Discord channel/thread IDs to Claude Code session UUIDs.
-
-## Slash commands
-
-| Command | Description |
+| Key | What |
 |---|---|
-| `/help` | Show available commands |
-| `/new` | Clear context, start a new conversation |
-| `/model <name>` | Switch Claude model (sonnet, opus, haiku) |
-| `/cd <path>` | Switch working directory |
-| `/stop` | Kill running Claude process |
-| `/channels` | List configured channels |
-| `/reload-config` | Hot-reload `channel-config.json` |
-| `/sessions` | List all active sessions |
+| `name` | Label, used in logs and `!rooms`. |
+| `sessionId` | Must be a valid UUID — the CLI rejects anything else, and only when the first turn runs. Warned about at startup instead. |
+| `workingDirectory` | `cwd` for the turn, which is what decides whose `CLAUDE.md` is injected. |
+| `model` | Passed to `--model`. Overwrites the session's model every turn, so `!model` does not stick in a configured room. |
+| `systemPrompt` / `systemPromptMode` | Appended to Claude Code's own prompt. `"replace"` replaces it, including its tool-use guidance. |
+| `replyInThread` | Open a thread on every top-level message here, giving each exchange its own session. |
+| `requireMention` / `mentionPatterns` | Answer only when addressed. A `<name>` block addressed to this agent always counts. |
+| `allowBots` | Admit messages from senders not on the `humans` list, labelled `[Name]`. |
+| `humans` | MXIDs that count as human here. Falls back to `defaultHumans`; absent both, everyone is human. |
+| `relayRoom` | Where a block addressed to somebody not in this room is forwarded. |
+| `fetchHistory` | Prepend recent room messages to the prompt. Default true; off is usually what you want in a room with several speakers. |
+| `disallowedTools` | Passed to `--disallowed-tools`, by name rather than as an allowlist, so a connector authenticated later cannot appear by surprise. |
+| `maxCostUsdPerTurn` / `maxCostUsdPerDay` | Per-turn `--max-budget-usd`; per-day total in memory, so a restart forgives the day. |
+| `sessionGroup` | Rooms sharing a group share one session. A thread overrides it. |
+| `schedule` | `{ cron, timezone, prompt }` for a scheduled turn. |
+| `contextFile` | A file prepended to the system prompt, hot-reloaded with the config. |
 
-## Origin
+Top level: `rooms`, `defaults`, `defaultHumans`, `configuredRoomsOnly`.
 
-Forked from [fredchu/discord-claude-code-bot](https://github.com/fredchu/discord-claude-code-bot) and extended with channel-based multi-agent routing, scheduled jobs, context files, file attachments, streaming previews, and hot-reloaded config.
+## Things that cost somebody an afternoon
+
+- `--session-id` must be a valid UUID, and the CLI only says so when a turn runs.
+- `--disallowed-tools` is variadic, so bare words after it are swallowed as further rules. A rule matching no known tool only warns — a typo silently grants what it meant to withhold.
+- `--permission-mode dontAsk` means don't ask, **deny**.
+- Deny rules apply under `bypassPermissions`; allow rules do not, because everything is already allowed.
+- `bypassPermissions` refuses to start as root. `IS_SANDBOX=1` clears it; `CLAUDE_CODE_IN_SANDBOX=1` does not.
+- `CLAUDE_CODE_OAUTH_TOKEN` beats `~/.claude/.credentials.json` and declares `user:inference` only, so a setup-token session can never see claude.ai connectors however many times you log in beside it. The gateway blanks it when a credentials file exists.
+- The first line of `--output-format stream-json` is a `rate_limit_event`, not `init`.
+- `-p` does not wake on pushed events; it takes a turn when stdin delivers. Holding the connection out here is what removes that constraint rather than working around it.
 
 ## License
 
-MIT
+MIT, as upstream.

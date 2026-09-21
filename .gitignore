@@ -9,6 +9,7 @@ dist/
 
 # Runtime configs (copy from .example versions and edit locally)
 channel-config.json
+room-config.json
 contexts/*.md
 !contexts/*.example.md
 

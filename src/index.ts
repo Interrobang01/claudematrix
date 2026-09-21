@@ -8,6 +8,7 @@ import {
   MatrixTransport, MATRIX_MAX_LEN,
   type Msg, type Room, type IncomingMessage,
 } from "./matrix.js";
+import { relayBlocks, addressesUs } from "./relay.js";
 
 // --- ThreadMap (SQLite-backed) ---
 
@@ -18,6 +19,10 @@ type ThreadEntry = {
   createdAt: number;
   started: boolean;
   lastBotMessageId?: string;
+  /** Set when an AskUserQuestion is on screen and unanswered. Only a human can
+   *  clear it — see `onMessage`. Persisted, because a restart must not turn a
+   *  pending confirmation into one a relayed message can answer. */
+  awaitingAnswer?: number;
 };
 
 type ThreadMap = Record<string, ThreadEntry>;
@@ -37,6 +42,53 @@ db.exec(`CREATE TABLE IF NOT EXISTS threads (
   started INTEGER NOT NULL DEFAULT 0,
   lastBotMessageId TEXT
 )`);
+
+// Added after the fact; the table predates confirmations being gated.
+if (!(db.prepare("PRAGMA table_info(threads)").all() as any[]).some((c) => c.name === "awaitingAnswer")) {
+  db.exec("ALTER TABLE threads ADD COLUMN awaitingAnswer INTEGER");
+}
+
+// Which conversation a relayed block came from.
+//
+// An agent reaches a sibling by posting into the one room they share, because
+// that is the only room its account can post into — every room here is
+// `invite: 100` and every agent is power level 0, so no agent can open a
+// private room with another even if it wanted to. The shared room is therefore
+// also the log: every inter-agent message is visible in one room Terry is in,
+// and that falls out of the power levels rather than needing its own mechanism.
+//
+// The cost is that the reply arrives in the shared room, a long way from the
+// conversation that asked for it. This row is the way back: the thread root of
+// the relayed message in the shared room, mapped to the session that sent it.
+db.exec(`CREATE TABLE IF NOT EXISTS bridge (
+  relayRootId  TEXT PRIMARY KEY,
+  homeRoomId   TEXT NOT NULL,
+  homeThreadRootId TEXT,
+  homeThreadId TEXT NOT NULL,
+  addressee    TEXT NOT NULL,
+  hops         INTEGER NOT NULL DEFAULT 0,
+  createdAt    INTEGER NOT NULL
+)`);
+
+const stmtBridgeGet = db.prepare("SELECT * FROM bridge WHERE relayRootId = ?");
+const stmtBridgePut = db.prepare(
+  `INSERT OR REPLACE INTO bridge (relayRootId, homeRoomId, homeThreadRootId, homeThreadId, addressee, hops, createdAt)
+   VALUES (@relayRootId, @homeRoomId, @homeThreadRootId, @homeThreadId, @addressee, @hops, @createdAt)`,
+);
+const stmtBridgeHop = db.prepare("UPDATE bridge SET hops = hops + 1 WHERE relayRootId = ?");
+
+type Bridge = {
+  relayRootId: string;
+  homeRoomId: string;
+  homeThreadRootId: string | null;
+  homeThreadId: string;
+  addressee: string;
+  hops: number;
+};
+
+function lookupBridge(relayRootId: string): Bridge | null {
+  return (stmtBridgeGet.get(relayRootId) as Bridge | undefined) ?? null;
+}
 
 // One-time migration from JSON → SQLite
 if (fs.existsSync(JSON_PATH)) {
@@ -62,8 +114,8 @@ if (fs.existsSync(JSON_PATH)) {
 // Prepared statements
 const stmtGet = db.prepare("SELECT * FROM threads WHERE threadId = ?");
 const stmtUpsert = db.prepare(
-  `INSERT OR REPLACE INTO threads (threadId, sessionId, cwd, model, createdAt, started, lastBotMessageId)
-   VALUES (@threadId, @sessionId, @cwd, @model, @createdAt, @started, @lastBotMessageId)`,
+  `INSERT OR REPLACE INTO threads (threadId, sessionId, cwd, model, createdAt, started, lastBotMessageId, awaitingAnswer)
+   VALUES (@threadId, @sessionId, @cwd, @model, @createdAt, @started, @lastBotMessageId, @awaitingAnswer)`,
 );
 const stmtAll = db.prepare("SELECT * FROM threads");
 
@@ -75,6 +127,7 @@ function rowToEntry(row: any): ThreadEntry {
     createdAt: row.createdAt,
     started: !!row.started,
     lastBotMessageId: row.lastBotMessageId ?? undefined,
+    awaitingAnswer: row.awaitingAnswer ?? undefined,
   };
 }
 
@@ -95,6 +148,7 @@ function saveEntry(threadId: string, entry: ThreadEntry): void {
     createdAt: entry.createdAt,
     started: entry.started ? 1 : 0,
     lastBotMessageId: entry.lastBotMessageId ?? null,
+    awaitingAnswer: entry.awaitingAnswer ?? null,
   });
 }
 
@@ -383,7 +437,8 @@ function runClaudeStreaming(opts: {
 // Generate a short, intuitive thread title from a user message using Claude Haiku.
 // Returns null on failure — caller should fall back to the placeholder name.
 // Matrix has no interactive components, so a confirmation is a numbered list and
-// the answer is Terry's next message in the room. What the Discord buttons were
+// the answer is the next message in the room from somebody on the `humans`
+// list. What the buttons in the Discord era were
 // actually buying is untouched: the question is asked in the agent's own room,
 // where nobody but Terry speaks, and the answer carries his MXID as its sender.
 async function sendAskPrompt(
@@ -401,6 +456,10 @@ async function sendAskPrompt(
     );
     entry.lastBotMessageId = botReply.id;
   }
+  // Until Terry answers, this session takes nothing from anyone else. The room
+  // used to carry this by itself — only he could speak here — and once a
+  // sibling's words can be relayed in, it cannot.
+  entry.awaitingAnswer = Date.now();
   saveEntry(threadId, entry);
 }
 
@@ -602,9 +661,9 @@ function handleStreamText(ps: PreviewState, fullText: string): void {
   flushPreview(ps);
 }
 
-// --- Channel Config (agent routing) ---
+// --- Room config (agent routing) ---
 
-type ChannelSchedule = {
+type RoomSchedule = {
   cron: string;
   prompt: string;
   timezone?: string;
@@ -612,32 +671,46 @@ type ChannelSchedule = {
 
 type SystemPromptMode = "append" | "replace";
 
-type ChannelConfig = {
+type RoomConfig = {
   name: string;
   sessionId: string;
   systemPrompt?: string;
   systemPromptMode?: SystemPromptMode;
   workingDirectory?: string;
   model?: string;
-  schedule?: ChannelSchedule;
+  schedule?: RoomSchedule;
   contextFile?: string;
-  /** Answer only when mentioned. Default false — a configured channel replies to everything. */
+  /** Answer only when mentioned. Default false — a configured room replies to everything. */
   requireMention?: boolean;
   /** Extra case-insensitive regexes counted as a mention, so a bare name in plain
-   *  text routes as well as a real Discord ping does. */
+   *  text routes the way a real mention does. */
   mentionPatterns?: string[];
   /** Admit messages from sibling agents. Default false. */
   allowBots?: boolean;
   /** MXIDs that count as human here. Matrix has no bot flag, so this list is the
-   *  whole of the distinction: everyone else in the room is a sibling agent, and
-   *  only a human message clears the bot-turn budget. Absent, everyone is human. */
+   *  whole of the distinction: everyone else in the room is a sibling agent.
+   *  Absent, everyone is human.
+   *
+   *  It is also the only thing that can answer a confirmation — see
+   *  `awaitingAnswer`. That used to be guaranteed by the room instead: nobody
+   *  but Terry could speak in an agent's own room, so anything arriving there
+   *  was his. Relaying puts a sibling's words into that room, which makes the
+   *  room a worse piece of evidence than it was, and this list the ground truth
+   *  it was standing in for. */
   humans?: string[];
-  /** Consecutive bot-triggered turns allowed before this channel goes quiet
-   *  until a human speaks. Default DEFAULT_BOT_TURN_BUDGET. */
-  botTurnBudget?: number;
-  /** Prepend recent channel messages to the prompt. Default true. */
+  /** Where a `<name>` block addressed to somebody who is not in this room is
+   *  forwarded: the room this agent shares with its siblings. Absent, a block
+   *  is local addressing only and nothing leaves the room.
+   *
+   *  This is not a boundary and is not trying to be one — the agent is root in
+   *  its own container and can rewrite this file. What it cannot do is join a
+   *  room or invite anybody: that is power level 100 on the homeserver and
+   *  every agent here is 0. Which rooms this process can reach is decided in
+   *  Synapse; this key only picks one of them. */
+  relayRoom?: string;
+  /** Prepend recent room messages to the prompt. Default true. */
   fetchHistory?: boolean;
-  /** Channels sharing a group share one Claude Code session, so a conversation can
+  /** Rooms sharing a group share one Claude Code session, so a conversation can
    *  move between rooms without starting over. Give them the same `sessionId` too;
    *  otherwise whichever room speaks first seeds the group. */
   sessionGroup?: string;
@@ -654,12 +727,12 @@ type ChannelConfig = {
   replyInThread?: boolean;
   /** Passed to the CLI as --max-budget-usd, which aborts a turn mid-flight. */
   maxCostUsdPerTurn?: number;
-  /** Refuse new turns in this channel once the day's spend reaches this. */
+  /** Refuse new turns in this room once the day's spend reaches this. */
   maxCostUsdPerDay?: number;
 };
 
-type ChannelConfigFile = {
-  channels: Record<string, ChannelConfig>;
+type RoomConfigFile = {
+  rooms: Record<string, RoomConfig>;
   defaults?: {
     model?: string;
     systemPrompt?: string;
@@ -668,27 +741,46 @@ type ChannelConfigFile = {
   };
   /** MXIDs treated as human in every room lacking its own `humans` list. */
   defaultHumans?: string[];
-  /** Ignore mentions in channels that have no entry above. Default false, which is
+  /** Ignore mentions in rooms that have no entry above. Default false, which is
    *  upstream's behaviour: a mention anywhere the bot can see starts a turn with
-   *  DEFAULT_CWD, the generic prompt, and none of a channel's tool denials or
-   *  budgets. Where the channel list is a containment boundary, set this true. */
-  configuredChannelsOnly?: boolean;
+   *  DEFAULT_CWD, the generic prompt, and none of a room's tool denials or spend
+   *  ceiling. Where the room list is a containment boundary, set this true. */
+  configuredRoomsOnly?: boolean;
 };
 
-const CHANNEL_CONFIG_PATH = path.join(import.meta.dirname, "..", "channel-config.json");
+// `room-config.json` is the name; `channel-config.json` is what every existing
+// deployment has on disk, and the file is gitignored so nothing in the repo can
+// rename it for them. Both are watched and whichever exists is loaded — the
+// startup line says which, because a config that silently did not load has
+// looked exactly like one that did more than once in this project's history.
+const CONFIG_PATHS = ["room-config.json", "channel-config.json"]
+  .map((f) => path.join(import.meta.dirname, "..", f));
 
-function loadChannelConfig(): ChannelConfigFile {
-  try {
-    if (fs.existsSync(CHANNEL_CONFIG_PATH)) {
-      return JSON.parse(fs.readFileSync(CHANNEL_CONFIG_PATH, "utf8"));
-    }
-  } catch (err) {
-    console.error("[matrix-cc-bot] failed to load channel-config.json:", err);
-  }
-  return { channels: {} };
+function configPath(): string | null {
+  return CONFIG_PATHS.find((f) => fs.existsSync(f)) ?? null;
 }
 
-let channelConfig = loadChannelConfig();
+function loadRoomConfig(): RoomConfigFile {
+  try {
+    const found = configPath();
+    if (found) {
+      const raw = JSON.parse(fs.readFileSync(found, "utf8"));
+      // `channels` and `configuredChannelsOnly` are what the Discord-era config
+      // called these. The file is gitignored, so a deployment's copy can only be
+      // renamed by hand; both spellings load.
+      return {
+        ...raw,
+        rooms: raw.rooms ?? raw.channels ?? {},
+        configuredRoomsOnly: raw.configuredRoomsOnly ?? raw.configuredChannelsOnly ?? false,
+      };
+    }
+  } catch (err) {
+    console.error(`[matrix-cc-bot] failed to load ${configPath() ?? "room-config.json"}:`, err);
+  }
+  return { rooms: {} };
+}
+
+let roomConfig = loadRoomConfig();
 
 // --- Context File Cache ---
 
@@ -707,7 +799,7 @@ function loadContextFile(filePath: string): string {
   }
 }
 
-function getContextForChannel(config: ChannelConfig): string {
+function getContextForRoom(config: RoomConfig): string {
   if (!config.contextFile) return "";
   if (contextFileCache.has(config.contextFile)) {
     return contextFileCache.get(config.contextFile)!;
@@ -717,13 +809,13 @@ function getContextForChannel(config: ChannelConfig): string {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// `--session-id` must be a valid UUID. A bad one fails only on the channel's
+// `--session-id` must be a valid UUID. A bad one fails only on the room's
 // very first turn, which is a long way from where it was configured.
 function warnOnBadSessionIds(): void {
   const groups = new Map<string, Set<string>>();
-  for (const [cid, cfg] of Object.entries(channelConfig.channels)) {
+  for (const [cid, cfg] of Object.entries(roomConfig.rooms)) {
     if (!UUID_RE.test(cfg.sessionId)) {
-      console.error(`[matrix-cc-bot] channel ${cid} ("${cfg.name}") has sessionId "${cfg.sessionId}", which is not a UUID — its first turn will fail.`);
+      console.error(`[matrix-cc-bot] room ${cid} ("${cfg.name}") has sessionId "${cfg.sessionId}", which is not a UUID — its first turn will fail.`);
     }
     if (cfg.sessionGroup) {
       if (!groups.has(cfg.sessionGroup)) groups.set(cfg.sessionGroup, new Set());
@@ -732,14 +824,14 @@ function warnOnBadSessionIds(): void {
   }
   for (const [name, ids] of groups) {
     if (ids.size > 1) {
-      console.error(`[matrix-cc-bot] sessionGroup "${name}" spans ${ids.size} different sessionIds — whichever channel speaks first seeds the group and the rest are ignored.`);
+      console.error(`[matrix-cc-bot] sessionGroup "${name}" spans ${ids.size} different sessionIds — whichever room speaks first seeds the group and the rest are ignored.`);
     }
   }
 }
 
 function preloadContextFiles(): void {
   contextFileCache.clear();
-  for (const cfg of Object.values(channelConfig.channels)) {
+  for (const cfg of Object.values(roomConfig.rooms)) {
     if (cfg.contextFile) {
       loadContextFile(cfg.contextFile);
     }
@@ -750,21 +842,21 @@ preloadContextFiles();
 warnOnBadSessionIds();
 
 // Watch for config changes and reload
-fs.watchFile(CHANNEL_CONFIG_PATH, { interval: 5000 }, () => {
-  console.log("[matrix-cc-bot] reloading channel-config.json");
-  channelConfig = loadChannelConfig();
+for (const f of CONFIG_PATHS) fs.watchFile(f, { interval: 5000 }, () => {
+  console.log(`[matrix-cc-bot] reloading ${path.basename(f)}`);
+  roomConfig = loadRoomConfig();
   preloadContextFiles();
   warnOnBadSessionIds();
 });
 
-function getChannelAgent(channelId: string): ChannelConfig | null {
-  return channelConfig.channels[channelId] ?? null;
+function getRoomAgent(roomId: string): RoomConfig | null {
+  return roomConfig.rooms[roomId] ?? null;
 }
 
-// Which row a turn's session lives under. Channels sharing a `sessionGroup` share
+// Which row a turn's session lives under. Rooms sharing a `sessionGroup` share
 // one session: an agent working in the commons can ask for a confirmation on its
-// private channel and the same session sees the answer, which is what keeps the
-// private channel meaningful instead of merely quieter.
+// private room and the same session sees the answer, which is what keeps the
+// private room meaningful instead of merely quieter.
 //
 // A thread overrides the group and gets a session of its own. That is the point
 // of threading a conversation — a bounded context you clear by starting another
@@ -772,19 +864,21 @@ function getChannelAgent(channelId: string): ChannelConfig | null {
 // exchange threaded in the commons can no longer ask for confirmation in the
 // agent's private room and see the answer. Top-level traffic keeps the group and
 // keeps that property. Thread deliberately.
-function sessionKey(roomId: string, agent: ChannelConfig | null, threadRootId?: string): string {
+function sessionKey(roomId: string, agent: RoomConfig | null, threadRootId?: string): string {
   if (threadRootId) return `thread:${threadRootId}`;
   return agent?.sessionGroup ? `group:${agent.sessionGroup}` : roomId;
 }
 
-function resolveSystemPromptMode(agent: ChannelConfig | null): SystemPromptMode {
-  return agent?.systemPromptMode ?? channelConfig.defaults?.systemPromptMode ?? "append";
+function resolveSystemPromptMode(agent: RoomConfig | null): SystemPromptMode {
+  return agent?.systemPromptMode ?? roomConfig.defaults?.systemPromptMode ?? "append";
 }
 
-// A bare name in message text should route as well as a real Discord ping does,
-// because a bot posting plain "@name" does not produce a ping — only the
-// `<@id>` form does, and text written by a model is posted verbatim.
-function matchesMentionPatterns(content: string, agent: ChannelConfig | null): boolean {
+// A bare name in message text has to route on its own. An agent writing "@emet"
+// produces no ping — a Matrix mention is a pill or an `m.mentions` field, and a
+// model's text is posted verbatim — so routing between agents matches text.
+// The `<name>` block is the form siblings actually use; this stays for a human
+// typing a name by hand.
+function matchesMentionPatterns(content: string, agent: RoomConfig | null): boolean {
   const patterns = agent?.mentionPatterns;
   if (!patterns?.length) return false;
   return patterns.some((pattern) => {
@@ -797,36 +891,31 @@ function matchesMentionPatterns(content: string, agent: ChannelConfig | null): b
   });
 }
 
-// --- Bot-turn budget ---
-
-// Admitting other bots is what lets two of them hold a conversation, and
-// therefore also what lets them answer each other until something kills the
-// process. Instruction alone has been observed to fail at this — the runaway
-// case is two agents being polite, not two agents misbehaving — so the ceiling
-// is mechanical: N consecutive bot-triggered turns per channel, cleared by any
-// message from a human.
-const DEFAULT_BOT_TURN_BUDGET = 6;
-const botTurnsUsed = new Map<string, number>();
-
-function consumeBotTurnBudget(channelId: string, fromBot: boolean, agent: ChannelConfig | null): boolean {
-  if (!fromBot) {
-    botTurnsUsed.delete(channelId);
-    return true;
-  }
-  const budget = agent?.botTurnBudget ?? DEFAULT_BOT_TURN_BUDGET;
-  const used = (botTurnsUsed.get(channelId) ?? 0) + 1;
-  botTurnsUsed.set(channelId, used);
-  if (used > budget) {
-    console.log(`[matrix-cc-bot] bot-turn budget (${budget}) spent in ${channelId} — quiet until a human speaks`);
-    return false;
-  }
-  return true;
-}
+// --- Runaway exchanges ---
+//
+// There used to be a ceiling here: N consecutive sibling-triggered turns per
+// room, cleared by any human message. It was built when *any* message in a
+// shared room woke every agent in it, so two agents being polite at each other
+// was a live failure mode with no deliberate act behind it.
+//
+// Addressing is explicit now. A turn only reaches a sibling because the agent
+// wrote a block addressed to them, so a runaway exchange takes a decision at
+// every hop rather than none. The ceiling had also become actively wrong: it
+// counted per room and suppressed *silently*, so a long, legitimate exchange in
+// one bridged thread would stop mid-sentence with nothing said about why, in a
+// room whose other conversations were fine. A loop you can see beats a brake
+// that fires on the wrong thing.
+//
+// What remains: `maxCostUsdPerDay`, the backstop that actually matters because
+// a loop is a bill before it is anything else; NO_RESPONSE, the graceful end an
+// agent can choose; and `bridge.hops`, counted and logged so a loop is visible
+// in the log and in the database while it is still happening.
+const HOPS_NOISY = 12;
 
 // --- Turn serialization ---
 
 // A message arriving mid-turn queues instead of being rejected: with several
-// speakers in one channel, mid-turn arrival is the normal case rather than the
+// speakers in one room, mid-turn arrival is the normal case rather than the
 // exception.
 const MAX_QUEUE_DEPTH = 4;
 
@@ -876,27 +965,27 @@ function acquireTurn(key: string): Promise<(() => void) | null> {
 // so the ceiling is enforced here rather than left to the model to observe.
 // In memory only: a restart forgives the day's spend.
 type Spend = { day: string; usd: number; notified: boolean };
-const spendByChannel = new Map<string, Spend>();
+const spendByRoom = new Map<string, Spend>();
 
 function utcDay(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-function recordSpend(channelId: string, usd: number | undefined): void {
+function recordSpend(roomId: string, usd: number | undefined): void {
   if (!usd) return;
   const day = utcDay();
-  const rec = spendByChannel.get(channelId);
+  const rec = spendByRoom.get(roomId);
   if (!rec || rec.day !== day) {
-    spendByChannel.set(channelId, { day, usd, notified: false });
+    spendByRoom.set(roomId, { day, usd, notified: false });
   } else {
     rec.usd += usd;
   }
 }
 
-/** True when the channel is out of budget for today; notifies once per day. */
-function overDailyBudget(channelId: string, agent: ChannelConfig | null): { over: boolean; announce: boolean; spent: number; cap: number } {
+/** True when the room is out of budget for today; notifies once per day. */
+function overDailyBudget(roomId: string, agent: RoomConfig | null): { over: boolean; announce: boolean; spent: number; cap: number } {
   const cap = agent?.maxCostUsdPerDay ?? 0;
-  const rec = spendByChannel.get(channelId);
+  const rec = spendByRoom.get(roomId);
   const spent = rec && rec.day === utcDay() ? rec.usd : 0;
   if (!cap || spent < cap) return { over: false, announce: false, spent, cap };
   const announce = !!rec && !rec.notified;
@@ -906,7 +995,7 @@ function overDailyBudget(channelId: string, agent: ChannelConfig | null): { over
 
 // --- Silent turns ---
 
-// An explicit way for the model to decline to post. In a channel where bots hear
+// An explicit way for the model to decline to post. In a room where bots hear
 // each other, not posting is what ends an exchange, so the graceful exit needs to
 // be something the model can choose rather than something it has to be stopped
 // from doing.
@@ -929,8 +1018,11 @@ if (!ACCESS_TOKEN) {
 const threadMap = loadMap();
 const transport = new MatrixTransport(HOMESERVER_URL, ACCESS_TOKEN, STORAGE_PATH);
 
-// Slash commands are Discord application commands; Matrix has no equivalent
-// registry, so they are plain text prefixes. Same names, same behaviour.
+// This agent's own name, as siblings write it in a `<name>` block: the
+// localpart of its MXID. Filled in at startup, before any message is handled.
+let selfName = "";
+
+// Matrix has no command registry, so these are plain text prefixes.
 const TEXT_COMMANDS = [
   ["!help", "Show available commands"],
   ["!new", "Clear context — start a new conversation"],
@@ -939,7 +1031,7 @@ const TEXT_COMMANDS = [
   ["!stop", "Kill running Claude process"],
   ["!sessions", "List all active sessions"],
   ["!rooms", "List configured room agents"],
-  ["!reload-config", "Reload channel-config.json"],
+  ["!reload-config", "Reload the room config"],
 ] as const;
 
 // --- Text commands ---
@@ -947,7 +1039,7 @@ const TEXT_COMMANDS = [
 async function handleCommand(msg: IncomingMessage, room: Room, threadId: string): Promise<boolean> {
   const [cmd, ...rest] = msg.content.trim().split(/\s+/);
   const arg = rest.join(" ").trim();
-  const agent = getChannelAgent(msg.roomId);
+  const agent = getRoomAgent(msg.roomId);
 
   switch (cmd) {
     case "!help":
@@ -1002,19 +1094,19 @@ async function handleCommand(msg: IncomingMessage, room: Room, threadId: string)
     }
 
     case "!rooms": {
-      const lines = Object.entries(channelConfig.channels).map(([rid, c]) =>
+      const lines = Object.entries(roomConfig.rooms).map(([rid, c]) =>
         `**${c.name}** \`${rid}\`${c.sessionGroup ? ` group:${c.sessionGroup}` : ""}${c.requireMention ? " mention" : ""}`);
       await room.send(lines.length ? lines.join("\n") : "*No configured rooms.*");
       return true;
     }
 
     case "!reload-config":
-      channelConfig = loadChannelConfig();
+      roomConfig = loadRoomConfig();
       preloadContextFiles();
       warnOnBadSessionIds();
       applyRoomHumans();
       startScheduledJobs();
-      await room.send(`♻️ *Reloaded — ${Object.keys(channelConfig.channels).length} room(s).*`);
+      await room.send(`♻️ *Reloaded — ${Object.keys(roomConfig.rooms).length} room(s).*`);
       return true;
   }
   return false;
@@ -1028,7 +1120,7 @@ function startScheduledJobs(): void {
   for (const task of scheduledTasks) task.stop();
   scheduledTasks.length = 0;
 
-  for (const [roomId, cfg] of Object.entries(channelConfig.channels)) {
+  for (const [roomId, cfg] of Object.entries(roomConfig.rooms)) {
     if (!cfg.schedule) continue;
     const { cron: cronExpr, prompt, timezone } = cfg.schedule;
     if (!cron.validate(cronExpr)) {
@@ -1042,7 +1134,7 @@ function startScheduledJobs(): void {
       const room = transport.room(roomId);
       const threadId = sessionKey(roomId, cfg);
       const entry = getOrCreate(threadMap, threadId,
-        cfg.workingDirectory ?? channelConfig.defaults?.workingDirectory ?? DEFAULT_CWD, cfg.sessionId);
+        cfg.workingDirectory ?? roomConfig.defaults?.workingDirectory ?? DEFAULT_CWD, cfg.sessionId);
 
       // Cron takes the same lane as a message: `running` only fills once a child
       // has spawned, so checking it alone races a turn that is still starting.
@@ -1073,6 +1165,50 @@ function startScheduledJobs(): void {
   if (scheduledTasks.length) console.log(`[matrix-cc-bot] started ${scheduledTasks.length} scheduled job(s)`);
 }
 
+/** Forward every `<name>` block in a turn's output to the room this agent
+ *  shares with its siblings, and remember where each one came from.
+ *
+ *  Only the block travels, never the whole message. A turn is written for Terry
+ *  and will be full of context meant for him; what crosses into a room another
+ *  agent can read is exactly the text the agent wrapped and nothing else. That
+ *  is the difference between a tag and a bare @mention, and it is the reason
+ *  for the tag.
+ *
+ *  In the shared room itself there is nothing to forward — both parties are
+ *  already there, and the tag is only a wake signal. */
+async function forwardRelayBlocks(
+  text: string,
+  ctx: { roomId: string; threadId: string; agent: RoomConfig | null },
+): Promise<void> {
+  const relayRoomId = ctx.agent?.relayRoom;
+  if (!relayRoomId || relayRoomId === ctx.roomId) return;
+
+  // `thread:<root>` is the only session key that names an event, and a relayed
+  // answer has to come back to the thread it was asked from, not to the room.
+  const homeThreadRootId = ctx.threadId.startsWith("thread:") ? ctx.threadId.slice(7) : null;
+
+  for (const block of relayBlocks(text, selfName)) {
+    try {
+      // Posted verbatim, tag included: it is what wakes the addressee on the
+      // other side, and it is what tells a reader of the shared room who the
+      // message is for.
+      const root = await transport.room(relayRoomId).send(`<${block.to}>${block.body}</${block.to}>`);
+      stmtBridgePut.run({
+        relayRootId: root.id,
+        homeRoomId: ctx.roomId,
+        homeThreadRootId,
+        homeThreadId: ctx.threadId,
+        addressee: block.to,
+        hops: 0,
+        createdAt: Date.now(),
+      });
+      console.log(`[matrix-cc-bot] relayed to ${block.to} → ${relayRoomId} ${root.id.slice(0, 8)}… (home ${ctx.threadId})`);
+    } catch (err) {
+      console.error(`[matrix-cc-bot] relay to ${block.to} failed:`, (err as Error).message);
+    }
+  }
+}
+
 // --- One turn ---
 
 /** Runs Claude for one turn and delivers the result. Shared by messages and cron. */
@@ -1081,7 +1217,7 @@ async function runTurn(opts: {
   roomId: string;
   threadId: string;
   entry: ThreadEntry;
-  agent: ChannelConfig | null;
+  agent: RoomConfig | null;
   prompt: string;
   replyTo?: Msg;
   filePaths?: string[];
@@ -1094,10 +1230,10 @@ async function runTurn(opts: {
     : await room.send("⏳ *Thinking...*");
   await transport.setTyping(roomId, true);
 
-  const baseSystemPrompt = agent?.systemPrompt ?? channelConfig.defaults?.systemPrompt ?? SYSTEM_PROMPT;
-  const channelContext = agent ? getContextForChannel(agent) : "";
-  const systemPrompt = channelContext
-    ? `Channel context:\n${channelContext}\n\n${baseSystemPrompt}`
+  const baseSystemPrompt = agent?.systemPrompt ?? roomConfig.defaults?.systemPrompt ?? SYSTEM_PROMPT;
+  const roomContext = agent ? getContextForRoom(agent) : "";
+  const systemPrompt = roomContext
+    ? `Room context:\n${roomContext}\n\n${baseSystemPrompt}`
     : baseSystemPrompt;
 
   const runOpts = {
@@ -1166,6 +1302,8 @@ async function runTurn(opts: {
 
     entry.lastBotMessageId = botReply.id;
     saveEntry(threadId, entry);
+
+    await forwardRelayBlocks(result.text, { roomId, threadId, agent });
   } catch (err) {
     if (previewState.timer) clearTimeout(previewState.timer);
     if (previewState.msg) await previewState.msg.edit(`Error: ${(err as Error).message}`).catch(() => {});
@@ -1180,29 +1318,34 @@ async function runTurn(opts: {
 
 /** Push each room's human list into the transport, so isHuman is answerable. */
 function applyRoomHumans(): void {
-  for (const [roomId, cfg] of Object.entries(channelConfig.channels)) {
-    transport.setHumans(roomId, cfg.humans ?? channelConfig.defaultHumans ?? []);
+  for (const [roomId, cfg] of Object.entries(roomConfig.rooms)) {
+    transport.setHumans(roomId, cfg.humans ?? roomConfig.defaultHumans ?? []);
   }
 }
 
 transport.onMessage(async (msg) => {
   let releaseTurn: (() => void) | null = null;
   try {
-    const agent = getChannelAgent(msg.roomId);
+    const agent = getRoomAgent(msg.roomId);
 
     // Matrix has no bot flag, so "from a sibling" is "not on the human list".
     const fromBot = !msg.isHuman;
     if (fromBot && !(agent?.allowBots ?? false)) return;
 
-    const isMentioned = msg.mentionsUs || matchesMentionPatterns(msg.content, agent);
+    // A `<name>` block addressed to us is a mention, and in a shared room it is
+    // the one siblings actually use: a bot posting plain `@name` produces no
+    // ping, and a tag is unambiguous where a name in prose is not.
+    const isMentioned = msg.mentionsUs
+      || matchesMentionPatterns(msg.content, agent)
+      || addressesUs(msg.content, selfName);
 
     if (agent) {
       if ((agent.requireMention ?? false) && !isMentioned) return;
     } else if (isMentioned) {
       // A mention in a room with no config. Whether that is a feature or a hole
       // in a boundary depends on the deployment, so it is a setting.
-      if (channelConfig.configuredChannelsOnly) {
-        console.log(`[matrix-cc-bot] mention in unconfigured room ${msg.roomId} — ignored (configuredChannelsOnly)`);
+      if (roomConfig.configuredRoomsOnly) {
+        console.log(`[matrix-cc-bot] mention in unconfigured room ${msg.roomId} — ignored (configuredRoomsOnly)`);
         return;
       }
     } else {
@@ -1220,36 +1363,76 @@ transport.onMessage(async (msg) => {
       if (await handleCommand(msg, room, sessionKey(msg.roomId, agent, inThread))) return;
     }
 
-    if (!consumeBotTurnBudget(msg.roomId, fromBot, agent)) return;
-
-    const budget = overDailyBudget(msg.roomId, agent);
-    if (budget.over) {
-      console.log(`[matrix-cc-bot] daily budget spent in ${msg.roomId}: $${budget.spent.toFixed(2)} of $${budget.cap.toFixed(2)}`);
-      if (budget.announce) {
-        await room.send(`💸 *Daily budget reached ($${budget.spent.toFixed(2)} of $${budget.cap.toFixed(2)}). Quiet until UTC midnight.*`).catch(() => {});
-      }
-      return;
-    }
-
     const content = msg.content.trim();
     if (!content && msg.attachments.length === 0) return;
 
     // A message already in a thread stays there. A top-level message opens one
     // only where the room asks for it.
     const outThread = inThread ?? ((agent?.replyInThread ?? false) ? msg.id : undefined);
-    const turnRoom = outThread === inThread ? room : transport.room(msg.roomId, outThread);
 
-    const threadId = sessionKey(msg.roomId, agent, outThread);
-    const agentCwd = agent?.workingDirectory ?? channelConfig.defaults?.workingDirectory ?? DEFAULT_CWD;
-    const agentModel = agent?.model ?? channelConfig.defaults?.model ?? "opus";
+    // An answer to something this agent relayed. It arrived in the shared room,
+    // but it belongs to the conversation that asked for it, so the turn runs in
+    // that session and its output goes back to that thread. Everything below
+    // this point is the ordinary path with a different room and session.
+    const bridge = inThread ? lookupBridge(inThread) : null;
+    if (bridge && !fromBot) {
+      // Terry speaking in a bridged thread is Terry in the shared room, not an
+      // answer from a sibling. Routing it home would forge the one distinction
+      // the whole arrangement rests on.
+      console.log(`[matrix-cc-bot] human message in bridged thread ${inThread!.slice(0, 8)}… — not routed home`);
+    }
+    const routed = bridge && fromBot ? bridge : null;
+
+    const turnRoomId = routed ? routed.homeRoomId : msg.roomId;
+    const turnThreadRoot = routed ? (routed.homeThreadRootId ?? undefined) : outThread;
+    const turnRoom = transport.room(turnRoomId, turnThreadRoot);
+
+    const threadId = routed ? routed.homeThreadId : sessionKey(msg.roomId, agent, outThread);
+    // Spend, budget and tool denials follow the conversation, not the room the
+    // message happened to arrive in.
+    const turnAgent = routed ? getRoomAgent(routed.homeRoomId) : agent;
+    const agentCwd = turnAgent?.workingDirectory ?? roomConfig.defaults?.workingDirectory ?? DEFAULT_CWD;
+    const agentModel = turnAgent?.model ?? roomConfig.defaults?.model ?? "opus";
+
+    // Charged where the turn runs, which for a relayed answer is the room that
+    // asked the question rather than the shared room it came back through.
+    const budget = overDailyBudget(turnRoomId, turnAgent);
+    if (budget.over) {
+      console.log(`[matrix-cc-bot] daily budget spent in ${turnRoomId}: $${budget.spent.toFixed(2)} of $${budget.cap.toFixed(2)}`);
+      if (budget.announce) {
+        await room.send(`💸 *Daily budget reached ($${budget.spent.toFixed(2)} of $${budget.cap.toFixed(2)}). Quiet until UTC midnight.*`).catch(() => {});
+      }
+      return;
+    }
+
+    if (routed) {
+      stmtBridgeHop.run(routed.relayRootId);
+      if (routed.hops + 1 >= HOPS_NOISY) {
+        console.log(`[matrix-cc-bot] bridged thread ${routed.relayRootId.slice(0, 8)}… is ${routed.hops + 1} hops deep`);
+      }
+    }
 
     // Only a room-level session may be seeded from the configured `sessionId`.
     // Seeding a thread with it would make every new thread resume the one
     // long-lived session it was supposed to be an escape from.
-    const entry = agent
-      ? getOrCreate(threadMap, threadId, agentCwd, outThread ? undefined : agent.sessionId)
+    const entry = turnAgent
+      ? getOrCreate(threadMap, threadId, agentCwd, (routed || outThread) ? undefined : turnAgent.sessionId)
       : getOrCreate(threadMap, threadId, DEFAULT_CWD);
-    if (agent) { entry.cwd = agentCwd; entry.model = agentModel; }
+    if (turnAgent) { entry.cwd = agentCwd; entry.model = agentModel; }
+
+    // A confirmation is on screen in this session and has not been answered.
+    // Only a human can answer one: the `humans` list is the ground truth that
+    // the room used to stand in for. A sibling's message waits rather than
+    // being dropped on the floor — it is told so, in the thread it came from.
+    if (entry.awaitingAnswer && !msg.isHuman) {
+      console.log(`[matrix-cc-bot] ${threadId} is awaiting a confirmation — not taking a relayed turn`);
+      await room.send("*Waiting on Terry. Nothing here will be read until he answers.*").catch(() => {});
+      return;
+    }
+    if (entry.awaitingAnswer && msg.isHuman) {
+      entry.awaitingAnswer = undefined;
+      saveEntry(threadId, entry);
+    }
 
     releaseTurn = await acquireTurn(entry.sessionId);
     if (!releaseTurn) {
@@ -1257,8 +1440,8 @@ transport.onMessage(async (msg) => {
       return;
     }
 
-    // mxc:// is authenticated media, unlike a Discord CDN URL, so this goes
-    // through the client rather than a bare fetch.
+    // mxc:// is authenticated media, so this goes through the client rather
+    // than a bare fetch.
     const filePaths: string[] = [];
     for (const att of msg.attachments) {
       if (att.size > ATTACH_MAX_BYTES) {
@@ -1275,14 +1458,19 @@ transport.onMessage(async (msg) => {
       }
     }
 
-    const history = (agent?.fetchHistory ?? true)
+    const history = (!routed && (agent?.fetchHistory ?? true))
       ? await fetchThreadHistory(msg.roomId, entry, transport.getUserId(), msg.id)
       : "";
 
     // Once several speakers share a room the model has no other way to tell who
     // is talking, and who is talking is the whole of the routing. Only Terry's
     // word is Terry's, and this label is how that stays checkable.
-    const body = (agent?.allowBots ?? false) ? `[${msg.senderName}] ${content}` : content;
+    // Who spoke is `[Name]`; who a message is *for* is the `<name>` tag, and the
+    // two are never merged. A relayed answer is labelled even though the room it
+    // lands in admits no bots, because it is exactly there that the label is
+    // load-bearing: it is the only thing separating a sibling's words from
+    // Terry's in the room where his word is authority.
+    const body = (routed || (agent?.allowBots ?? false)) ? `[${msg.senderName}] ${content}` : content;
     let userMessage = body;
     if (filePaths.length === 1) {
       userMessage = `${body}\n\nThe user attached a file: ${filePaths[0]}`.trim();
@@ -1290,14 +1478,22 @@ transport.onMessage(async (msg) => {
       userMessage = `${body}\n\nThe user attached files:\n${filePaths.map((p) => `- ${p}`).join("\n")}`.trim();
     }
 
+    // A relayed answer is put into the home thread verbatim before the turn
+    // runs, so the conversation Terry is reading stays readable: he sees what
+    // the sibling actually said, not the agent's account of it afterwards.
+    if (routed) {
+      await turnRoom.send(userMessage).catch((err) =>
+        console.error("[matrix-cc-bot] posting relayed answer home failed:", (err as Error).message));
+    }
+
     await runTurn({
       room: turnRoom,
-      roomId: msg.roomId,
+      roomId: turnRoomId,
       threadId,
       entry,
-      agent,
+      agent: turnAgent,
       prompt: history ? `${history}${userMessage}` : userMessage,
-      replyTo: transport.msg(msg.roomId, msg.id, outThread),
+      replyTo: routed ? undefined : transport.msg(msg.roomId, msg.id, outThread),
       filePaths,
     });
   } catch (err) {
@@ -1321,6 +1517,7 @@ process.on("SIGTERM", shutdown);
 
 (async () => {
   const { userId, displayName } = await transport.start();
+  selfName = userId.split(":")[0].replace(/^@/, "").toLowerCase();
   console.log(`[matrix-cc-bot] ready as ${userId} ("${displayName}") on ${HOMESERVER_URL}`);
   console.log(
     `[matrix-cc-bot] auth: ${hasStoredCredentials()
@@ -1331,15 +1528,15 @@ process.on("SIGTERM", shutdown);
   );
 
   applyRoomHumans();
-  const configured = Object.entries(channelConfig.channels);
+  const configured = Object.entries(roomConfig.rooms);
   console.log(
     configured.length
-      ? `[matrix-cc-bot] ${configured.length} room(s): ` + configured
-          .map(([rid, c]) => `${c.name}=${rid}${c.sessionGroup ? ` group:${c.sessionGroup}` : ""}${c.requireMention ? " mention" : ""}${c.allowBots ? " bots" : ""}${c.fetchHistory === false ? " nohistory" : ""}${c.replyInThread ? " thread" : ""}${c.disallowedTools?.length ? ` -${c.disallowedTools.length}tools` : ""}`)
+      ? `[matrix-cc-bot] ${configured.length} room(s) from ${path.basename(configPath()!)}: ` + configured
+          .map(([rid, c]) => `${c.name}=${rid}${c.sessionGroup ? ` group:${c.sessionGroup}` : ""}${c.requireMention ? " mention" : ""}${c.allowBots ? " bots" : ""}${c.fetchHistory === false ? " nohistory" : ""}${c.replyInThread ? " thread" : ""}${c.relayRoom ? " relay" : ""}${c.disallowedTools?.length ? ` -${c.disallowedTools.length}tools` : ""}`)
           .join(", ")
-      : "[matrix-cc-bot] no channel-config.json — mention-only with defaults",
+      : "[matrix-cc-bot] no room-config.json — mention-only with defaults",
   );
-  console.log(`[matrix-cc-bot] unconfigured rooms: ${channelConfig.configuredChannelsOnly ? "ignored" : "answer on mention with defaults"}`);
+  console.log(`[matrix-cc-bot] unconfigured rooms: ${roomConfig.configuredRoomsOnly ? "ignored" : "answer on mention with defaults"}`);
   console.log(`[matrix-cc-bot] backfill: events before startup are dropped`);
 
   startScheduledJobs();

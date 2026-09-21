@@ -1,126 +1,73 @@
-# Claudecord
+# CLAUDE.md
 
-A Discord bot that wraps Claude Code CLI, routing different Discord channels to
-different Claude Code agents with their own sessions, working directories, and
-system prompts.
+Guidance for Claude Code working in this repository.
 
-This file gives Claude Code (or any AI coding assistant working in this repo) a
-project-level orientation. It's public-safe — no secrets, no personal paths.
+## What this is
 
-## Project Overview
+A Matrix bot that gives each room its own Claude Code session. A Node process
+holds one `/sync` connection and spawns **one `claude -p` per message**; the
+child exits when the turn ends. Nothing runs between messages. Session
+continuity is a UUID plus `--resume`, and the transcript lives in Claude Code's
+own storage, not here.
 
-- **Stack:** TypeScript, Node.js, discord.js, better-sqlite3
-- **Entry point:** `src/index.ts` (single-file architecture, ~1500 LOC)
-- **Origin:** fork of [fredchu/discord-claude-code-bot](https://github.com/fredchu/discord-claude-code-bot),
-  extended with channel-based multi-agent routing, scheduled jobs, file attachments,
-  streaming previews, and hot-reloaded context files.
+- **Stack:** TypeScript, Node 22, matrix-bot-sdk, better-sqlite3, node-cron.
+- **Entry point:** `src/index.ts` — routing, sessions, spend, the relay.
+- **Transport:** `src/matrix.ts` — presents a `Room` you can `send()` to and a
+  `Msg` you can `edit()`/`reply()`/`delete()`. The policy code above it never
+  touches Matrix.
+- **Addressing:** `src/relay.ts` — the `<name>...</name>` block, its parsing and
+  its rendering.
+- **Origin:** a fork of [ecmulli/claudecord](https://github.com/ecmulli/claudecord),
+  which is itself fredchu/discord-claude-code-bot plus channel routing. The
+  Discord vocabulary in old config files comes from there.
 
-## Architecture
-
-```
-Discord message → Channel Router → claude -p "..." --resume <sessionId> → Discord reply
-```
-
-- **Thread mode (original):** Responds in threads when @mentioned. Each thread gets its own session.
-- **Channel mode (added):** Configured channels in `channel-config.json` respond to all messages.
-  Each channel maps to a stable Claude Code session with its own cwd, model, and system prompt.
-  `requireMention` narrows a configured channel to mentions only without giving up its
-  system prompt or context file.
-- **Multi-bot channels:** `allowBots` admits other bots so several instances can talk in one
-  channel. Routing is by name (`mentionPatterns`, since a bot posting plain `@name` produces
-  no Discord ping), the graceful exit is a `NO_RESPONSE` reply, and `botTurnBudget` is the
-  mechanical ceiling on a runaway exchange.
-
-### Key Components (all in src/index.ts)
-
-- **ThreadMap (SQLite):** Maps Discord thread/channel IDs → Claude Code session
-  entries (sessionId, cwd, model, etc.).
-- **Channel Config:** `channel-config.json` maps Discord channel IDs → agent configs.
-  Hot-reloaded via `fs.watchFile`.
-- **runClaudeStreaming():** Spawns `claude -p` with `--output-format stream-json`,
-  parses streaming output, handles tool use callbacks.
-- **Preview system:** Posts "thinking..." message, edits it with streaming partial
-  results, then replaces with final chunked response.
-- **AskUserQuestion:** Claude's permission denials are rendered as Discord buttons.
-- **childEnv():** Builds the environment for every spawned `claude`. Prefers
-  `~/.claude/.credentials.json` and blanks `CLAUDE_CODE_OAUTH_TOKEN`, because the env token
-  short-circuits the credentials file in the CLI's resolver and declares only
-  `user:inference` — an inherited token silently strips scopes with no error anywhere.
-- **acquireTurn():** Per-session lane. Mid-turn messages queue (depth 4) rather than being
-  rejected; scheduled jobs take the same lane, since `running` is only populated once a
-  child has actually spawned.
-
-### Session Management
-
-- Sessions are identified by UUID (threads) or stable config ID (channels)
-- `--resume <sessionId>` maintains context across messages
-- `/new` resets the session (generates new ID for threads, appends timestamp for channels)
-- Spend is capped per turn (`maxCostUsdPerTurn` → `--max-budget-usd`) and per UTC day
-  (`maxCostUsdPerDay`, tracked in memory)
-
-## Running the Bot (pm2)
-
-The bot is designed to run under pm2 for auto-restart and persistence.
-
-```bash
-# Start
-pm2 start ecosystem.config.cjs
-
-# Common operations (replace "claudecord" with whatever you set in ecosystem.config.cjs)
-pm2 restart claudecord      # Restart after code changes
-pm2 stop claudecord         # Stop the bot
-pm2 logs claudecord         # Watch live logs
-pm2 logs claudecord --lines 50
-
-# Status
-pm2 status
-pm2 monit
-
-# Survive reboots
-pm2 startup                 # Follow the printed instructions
-pm2 save
-```
-
-### Without pm2 (development)
+## Flow
 
 ```
-npm start                   # node --env-file=.env
-npm run start:op            # same, but wraps with `op run` for 1Password secrets
-npm run check               # TypeScript type-check
+room message → gating → session key → claude -p --resume <uuid> → message posted
+                                   ↘ <name> block → shared room → bridge row
+                    bridged reply ← ↙
 ```
 
-### Troubleshooting
+## Things to know before changing anything
 
-```bash
-# Crash logs
-pm2 logs claudecord --err --lines 20
+- **`claude -p` is the only path that spends a subscription.** Anything built on
+  `@anthropic-ai/claude-agent-sdk` draws the capped Agent-SDK credit bucket
+  instead. Do not "modernise" the spawn.
+- **`--append-system-prompt`, never `--system-prompt`.** Replacing drops Claude
+  Code's own tool-use guidance along with everything else. `systemPromptMode:
+  "replace"` exists and is opt-in for that reason.
+- **`--disallowed-tools` is variadic.** The prompt goes in `-p` up front, never
+  positionally, or it is swallowed as another rule.
+- **Deny rules survive `bypassPermissions`; allow rules do not.**
+- **`--session-id` must be a UUID**, and the CLI only says so when a turn runs.
+  Startup warns instead.
+- **A tag is not evidence.** `<name>` says who a message is *for* and is written
+  by whoever wrote the message. `[Name]` says who *wrote* it and is put on by
+  the gateway. Never merge them, and never let a tag decide trust.
+- **`humans` is the trust boundary**, not the room. A confirmation blocks its
+  session until somebody on that list answers.
+- **A thread is not an access-control boundary.** It is a relation on events;
+  anyone in the room reads all of it. Scoping here comes from forwarding only
+  the tagged block, never from confining a recipient.
+- **Verify behaviour, not the config value.** This codebase has a history of
+  keys that were read by nothing (`replyInThread` sat inert in the config for
+  months) and of configs that silently failed to load. New config keys need a
+  startup line proving they were seen.
 
-# Node version mismatch after upgrade
-npm rebuild better-sqlite3
-pm2 restart claudecord
+## Layout
 
-# Duplicate instances (causes double messages)
-pkill -f "node --import=tsx src/index.ts"
-pm2 restart claudecord
+```
+src/index.ts              routing, sessions, spend, relay, commands, cron
+src/matrix.ts             transport
+src/relay.ts              <name> parsing and rendering
+room-config.json          per-room agents (gitignored, hot-reloaded)
+.env                      homeserver URL, access token, DEFAULT_CWD, CLAUDE_BIN
+threads.db                SQLite (WAL): sessions, and the relay bridge
+matrix-sync.json          /sync token (gitignored)
 ```
 
-## Configuration
+## Checks
 
-- `.env` — `DISCORD_TOKEN`, `GUILD_ID` (optional), `DEFAULT_CWD` (optional), `CLAUDE_BIN` (optional),
-  `SILENT_TOKEN` (optional, defaults to `NO_RESPONSE`)
-- `channel-config.json` — Channel-to-agent routing. Copy from `channel-config.example.json`
-  and fill in real channel IDs.
-- `contexts/*.md` — Per-channel context files loaded into the system prompt.
-  Copy templates from `contexts/*.example.md`.
-
-## Slash Commands
-
-`/new`, `/stop`, `/model`, `/cd`, `/channels`, `/reload-config`, `/sessions`, `/help`
-
-## Code Style
-
-- Single-file TypeScript with no build step (uses tsx)
-- Minimal dependencies — discord.js, better-sqlite3, node-cron
-- No Anthropic SDK dependency — spawns Claude Code CLI directly
-- Functions are flat, not class-based
-- Error handling: try/catch with console.error, graceful fallbacks to user
+`npm run check` (`tsc --noEmit`). There is no test suite; the relay parser is
+the part most worth exercising by hand before a deploy.

@@ -3,11 +3,10 @@
 // The point of this module is that the rest of the gateway does not know it
 // exists. It presents the two shapes index.ts already used — a room you can
 // `.send()` to, and a message you can `.edit()`, `.reply()` to and `.delete()`
-// — backed by matrix-bot-sdk instead of discord.js, so the policy code above
-// the transport (mention gating, budgets, turn queueing, session groups) ports
-// with no changes at all.
+// — so the policy code above the transport (mention gating, spend ceilings,
+// turn queueing, session groups, the sibling relay) never touches Matrix at all.
 //
-// Four things genuinely differ from Discord and are handled here:
+// Four things a chat transport is often assumed to provide, and does not here:
 //   1. There is no bot flag in Matrix. Who is human is an explicit MXID list.
 //   2. There are no buttons. AskUserQuestion renders as a numbered list.
 //   3. Markdown is not rendered unless you send HTML yourself.
@@ -17,6 +16,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { MatrixClient, SimpleFsStorageProvider } from "matrix-bot-sdk";
 import { marked } from "marked";
+import { markRelayTags } from "./relay.js";
 
 // Synapse's default max event size is 65536 bytes for the whole event; the body
 // has to fit inside that with formatted_body beside it. 16k of markdown leaves
@@ -74,10 +74,13 @@ function threadRelation(rootId: string, replyTo?: string): Record<string, any> {
 // Matrix clients sanitize incoming HTML against the spec's allowed-tag list
 // themselves, so this does not need to be a security boundary; it needs to
 // produce tags Element will actually keep. Tables survive here and did not on
-// Discord, which is why the "never use markdown tables" prompt line is gone.
+// here, which is why no prompt needs a "never use markdown tables" line.
 export function renderHtml(text: string): string {
   try {
-    return marked.parse(text, { async: false, breaks: true, gfm: true }) as string;
+    // A <name> block is an addressing tag, not HTML. Element would sanitize the
+    // tag away and render the block as ordinary prose, so it becomes a labelled
+    // quote before markdown ever sees it.
+    return marked.parse(markRelayTags(text), { async: false, breaks: true, gfm: true }) as string;
   } catch {
     return escapeHtml(text).replace(/\n/g, "<br/>");
   }
@@ -130,7 +133,7 @@ export class MatrixTransport {
       this.displayName = this.userId.split(":")[0].slice(1);
     }
     // Everything before this instant is history. Matrix replays on reconnect
-    // where Discord does not, and a two-hour outage must not wake N turns.
+    // on reconnect, and a two-hour outage must not wake N turns.
     this.startTs = Date.now();
     await this.client.start();
     return { userId: this.userId, displayName: this.displayName };
@@ -260,7 +263,7 @@ export class MatrixTransport {
     await this.client.setTyping(roomId, typing, 30000).catch(() => {});
   }
 
-  /** Authenticated media download. Discord CDN URLs were open; mxc:// is not. */
+  /** Authenticated media download: an mxc:// URI is not fetchable on its own. */
   async downloadMedia(mxc: string, filepath: string): Promise<void> {
     const res = await this.client.downloadContent(mxc);
     fs.mkdirSync(path.dirname(filepath), { recursive: true });

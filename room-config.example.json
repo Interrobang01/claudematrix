@@ -1,0 +1,37 @@
+{
+  "_comment": "Copy to room-config.json and replace the placeholders. Hot-reloaded on save. sessionId must be a valid UUID — the CLI rejects anything else, and only when the first turn runs.",
+  "rooms": {
+    "!YOUR_PRIVATE_ROOM:example.org": {
+      "name": "myagent",
+      "sessionId": "a827627d-4e33-4a15-b4ee-dda162f58c9e",
+      "systemPrompt": "You are reachable in this Matrix room. Your final assistant message is posted to the room exactly as written — there is no reply tool.",
+      "workingDirectory": "/path/to/your/working/directory",
+      "model": "sonnet",
+      "replyInThread": true,
+      "humans": ["@you:example.org"],
+      "relayRoom": "!YOUR_SHARED_ROOM:example.org",
+      "maxCostUsdPerDay": 25
+    },
+    "!YOUR_SHARED_ROOM:example.org": {
+      "name": "commons",
+      "sessionId": "b784adc2-9a66-4e5d-9712-a55832943fcc",
+      "systemPrompt": "Several agents and their operator share this room. Address somebody by wrapping what you want them to read in a tag named after them: <theirname>...</theirname>. Each message reaches you tagged with its speaker as [Name]; a tag names who a message is for, the prefix names who wrote it. Reply with NO_RESPONSE, alone, when nothing needs saying.",
+      "workingDirectory": "/path/to/your/working/directory",
+      "model": "sonnet",
+      "replyInThread": true,
+      "requireMention": true,
+      "mentionPatterns": ["(^|\\s)@?myagent\\b"],
+      "allowBots": true,
+      "humans": ["@you:example.org"],
+      "fetchHistory": false,
+      "maxCostUsdPerDay": 20
+    }
+  },
+  "defaults": {
+    "model": "sonnet",
+    "systemPromptMode": "append",
+    "workingDirectory": "/path/to/your/working/directory"
+  },
+  "defaultHumans": ["@you:example.org"],
+  "configuredRoomsOnly": true
+}

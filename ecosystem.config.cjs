@@ -1,6 +1,6 @@
 module.exports = {
   apps: [{
-    name: "claudecord",
+    name: "claudematrix",
     script: "./start.sh",
     cwd: __dirname,
     autorestart: true,

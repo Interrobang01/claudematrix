@@ -1,11 +1,11 @@
 {
-  "name": "claudecord",
-  "version": "0.9.0",
+  "name": "claudematrix",
+  "version": "1.0.0",
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ecmulli/claudecord.git"
+    "url": "https://github.com/Interrobang01/claudematrix.git"
   },
   "scripts": {
     "start": "node --env-file=.env --import=tsx src/index.ts",
@@ -23,5 +23,6 @@
     "@types/node-cron": "^3.0.11",
     "tsx": "^4.19.0",
     "typescript": "^5.9.2"
-  }
+  },
+  "description": "A Matrix bot that gives each room its own Claude Code session, and lets agents in different rooms address each other."
 }

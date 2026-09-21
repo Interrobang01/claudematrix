@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.0.0 - 2026-09-20
+
+Renamed **claudecord → claudematrix**. The transport has been Matrix since
+2026-08-29; the package, the README and the example config still described a
+Discord bot, which made the repository the least accurate description of itself
+available anywhere.
+
+### Added
+- **Sibling addressing.** An agent addresses another by writing
+  `<name>...</name>`. In a shared room the tag is a wake signal; in a room with
+  `relayRoom` set, the block — and only the block — is forwarded into that room,
+  and a `bridge` row routes the answer back into the thread that asked for it.
+  Nobody joins anything, and the whole exchange stays visible in the one room
+  the operator is also in.
+- `relayRoom`, per room.
+- `[Name]` prefixes on relayed answers, regardless of the destination room's
+  `allowBots`. Who spoke is the prefix; who a message is for is the tag.
+- `bridge.hops`, counted and logged, so a runaway exchange is visible in the log
+  and in the database while it is still running.
+- `<name>` blocks render as a labelled quote. Matrix clients sanitize unknown
+  HTML, so the tag would otherwise vanish from the rendered body while staying
+  in the plaintext one.
+
+### Changed
+- **A confirmation can only be answered by somebody on the `humans` list.**
+  Previously this was carried by the room: nobody but the operator could speak
+  in an agent's own room, so anything arriving there was theirs. Relaying puts a
+  sibling's words into that room, so the list has to be the ground truth the
+  room was standing in for. A pending confirmation blocks its session; a
+  relayed message arriving meanwhile is told so rather than dropped.
+- `channel-config.json` → `room-config.json`, `channels` → `rooms`,
+  `configuredChannelsOnly` → `configuredRoomsOnly`. All three old spellings
+  still load — the file is gitignored, so a deployment's copy can only be
+  renamed by hand — and the startup line names the file it used.
+- Room config, spend ceiling and tool denials now follow the *conversation*
+  rather than the room a message arrived in, so a relayed answer is charged and
+  constrained where the work is happening.
+
+### Removed
+- **The bot-turn budget.** It was built when any message in a shared room woke
+  every agent in it, so two agents being polite at each other was a live failure
+  mode with no deliberate act behind it. Addressing is explicit now, and the
+  ceiling had become actively wrong: it counted per room and suppressed
+  silently, so a long legitimate exchange in one bridged thread would stop
+  mid-sentence, in a room whose other conversations were fine. `maxCostUsdPerDay`
+  and `NO_RESPONSE` remain; `bridge.hops` makes a loop visible instead.
+
 ## 0.8.2 - 2026-04-02
 
 ### Fixes
