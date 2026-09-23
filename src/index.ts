@@ -291,7 +291,24 @@ type PermissionDenial = {
   tool_input: { questions: AskQuestion[] };
 };
 
-type RunResult = { text: string; exitCode: number; costUsd?: number; is_error?: boolean; permissionDenials?: PermissionDenial[] };
+type RunResult = {
+  /** Every text block of the turn, in order. */
+  text: string;
+  /** The last one alone — what the CLI reports as the turn's `result`. */
+  finalText: string;
+  exitCode: number;
+  costUsd?: number;
+  is_error?: boolean;
+  permissionDenials?: PermissionDenial[];
+};
+
+/** A turn that narrates, calls a tool, then answers is several text blocks, and
+ *  the CLI's `result` is only the last of them. Everything said before the last
+ *  tool call was being dropped on the floor, so the posted message is all of
+ *  them joined. */
+function joinSegments(segments: string[]): string {
+  return segments.map((s) => s.trim()).filter(Boolean).join("\n\n");
+}
 
 function runClaudeStreaming(opts: {
   sessionId: string;
@@ -344,6 +361,10 @@ function runClaudeStreaming(opts: {
     let stderrBuf = "";
     let lastSeenText = "";
     let resultText = "";
+    // One entry per text block. stream-json emits a message once per content
+    // block under a shared message id, so the id plus the text is the identity.
+    const segments: string[] = [];
+    const seenSegments = new Set<string>();
     let costUsd: number | undefined;
     let isError = false;
     let permissionDenials: PermissionDenial[] | undefined;
@@ -372,9 +393,16 @@ function runClaudeStreaming(opts: {
                 opts.callbacks?.onToolUse?.(block.name);
               }
             }
+            if (messageText) {
+              const key = `${event.message.id ?? ""}\0${messageText}`;
+              if (!seenSegments.has(key)) {
+                seenSegments.add(key);
+                segments.push(messageText);
+              }
+            }
             if (messageText && messageText !== lastSeenText) {
               lastSeenText = messageText;
-              opts.callbacks?.onText?.(messageText);
+              opts.callbacks?.onText?.(joinSegments(segments));
             }
           }
 
@@ -402,10 +430,11 @@ function runClaudeStreaming(opts: {
       settled = true;
       running.delete(opts.sessionId);
       child.kill("SIGTERM");
-      const partial = resultText || lastSeenText || "";
+      const partial = joinSegments(segments) || resultText;
       if (partial) {
         resolve({
           text: partial + "\n\n⚠️ *Task timed out after 90 min — partial result above.*",
+          finalText: lastSeenText || resultText,
           exitCode: 124,
           costUsd,
         });
@@ -428,8 +457,12 @@ function runClaudeStreaming(opts: {
       clearTimeout(timer);
       running.delete(opts.sessionId);
       const errHint = stderrBuf.trim() ? `\n\n⚠️ stderr: ${stderrBuf.trim().slice(0, 500)}` : "";
-      const text = resultText || lastSeenText || `(no output)${errHint}`;
-      resolve({ text, exitCode: code ?? 1, costUsd, is_error: isError, permissionDenials });
+      // An error result (budget, a forgotten session) is not one of the text
+      // blocks, and is the part worth seeing.
+      if (isError && resultText && !segments.includes(resultText)) segments.push(resultText);
+      const text = joinSegments(segments) || resultText || `(no output)${errHint}`;
+      const finalText = segments.length ? segments[segments.length - 1] : text;
+      resolve({ text, finalText, exitCode: code ?? 1, costUsd, is_error: isError, permissionDenials });
     });
   });
 }
@@ -1277,7 +1310,9 @@ async function runTurn(opts: {
 
     // The model declined to speak. In a room where agents hear each other,
     // silence is what ends an exchange gracefully; the budget is the other way.
-    if (result.text.trim().startsWith(SILENT_TOKEN)) {
+    // Judged on the last block: a turn that says "let me check", looks, and then
+    // decides there is nothing to add has decided, and the narration goes too.
+    if (result.finalText.trim().startsWith(SILENT_TOKEN)) {
       await previewState.msg!.delete().catch(() => {});
       entry.started = true;
       saveEntry(threadId, entry);
