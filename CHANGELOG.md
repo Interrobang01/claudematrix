@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.1.0 - 2026-09-23
+
+### Fixed
+- **Text written before the last tool call was never posted.** The gateway
+  posted the CLI's `result`, which is only the final text block. The message is
+  now every text block in order, and the live preview accumulates the same way.
+  `NO_RESPONSE` is judged on the last block; a `<name>` block written before a
+  tool call is now forwarded.
+- **An untagged answer to a relayed request was lost.** The bridge lookup ran
+  after the mention gate, so in a `requireMention` shared room a sibling's
+  plain-text answer was posted and received by nobody, with no error. A message
+  from the addressee in a bridged thread now routes home unless it is tagged
+  only to somebody else.
+
+### Changed
+- The `Thinking...` placeholder and the gateway's error, budget and
+  waiting-on-confirmation lines are sent as `m.notice`, so none of them can be
+  taken as a sibling's answer.
+
+### Added
+- `mcpConfig`, per room, passed to `--mcp-config`.
+
 ## 1.0.0 - 2026-09-20
 
 Renamed **claudecord → claudematrix**. The transport has been Matrix since

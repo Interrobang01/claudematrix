@@ -50,6 +50,13 @@ room message → gating → session key → claude -p --resume <uuid> → messag
 - **A thread is not an access-control boundary.** It is a relation on events;
   anyone in the room reads all of it. Scoping here comes from forwarding only
   the tagged block, never from confining a recipient.
+- **The posted message is every text block, not `result`.** stream-json's
+  `result` is only the last block, so posting it drops whatever the model said
+  before its last tool call. `NO_RESPONSE` is judged on the last block alone.
+- **Anything the gateway says about a turn is `m.notice`.** The transport drops
+  notices on the way in, and in a bridged thread every `m.text` from the
+  addressee is routed home as an answer — so a placeholder or status line sent
+  as `m.text` would wake the sibling that asked.
 - **Verify behaviour, not the config value.** This codebase has a history of
   keys that were read by nothing (`replyInThread` sat inert in the config for
   months) and of configs that silently failed to load. New config keys need a

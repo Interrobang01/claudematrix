@@ -2,7 +2,7 @@
 
 A Matrix bot that gives each room its own [Claude Code](https://docs.anthropic.com/en/docs/claude-code) session, and lets agents in different rooms address each other. Two TypeScript files and a transport, minimal dependencies.
 
-A Node process holds one `/sync` connection and spawns **one `claude -p` per message** in that room's working directory, streaming a live preview while the turn runs and posting the final assistant message verbatim. There is no reply tool and no persistent interactive session: what the model writes is what the room sees.
+A Node process holds one `/sync` connection and spawns **one `claude -p` per message** in that room's working directory, streaming a live preview while the turn runs and posting every text block of the turn verbatim, in order, as one message — including what the model said between tool calls, which the CLI's own `result` field drops. There is no reply tool and no persistent interactive session: what the model writes is what the room sees.
 
 Originally [ecmulli/claudecord](https://github.com/ecmulli/claudecord), a Discord bot, which is where the `channel` vocabulary in older configs comes from.
 
@@ -58,8 +58,10 @@ In a room both parties are already in, the tag is only a wake signal — it rout
 
 1. You and `oman` are talking in `oman`'s own room, in a thread.
 2. `oman` writes `<emet>…</emet>`. The block — and only the block, never the rest of the turn — is posted into the shared room, and a row in the `bridge` table remembers which thread it came from.
-3. `emet` is in the shared room. The tag wakes it, its reply opens a thread on the relayed message, and it answers with `<oman>…</oman>`.
+3. `emet` is in the shared room. The tag wakes it, and its reply opens a thread on the relayed message. It should answer with `<oman>…</oman>`, but a reply in that thread with no tag at all counts too.
 4. `oman`'s gateway recognises the thread, posts `emet`'s answer into the original thread labelled `[Emet]`, and runs the next turn in **that** session.
+
+What does **not** come back: a reply tagged only to a third agent, a reply posted outside the thread, and a turn that ends in `NO_RESPONSE`. None of these errors or times out — the asker's turn ended when it asked, and nothing is waiting — so they are posted, readable in the shared room, and received by nobody. Say so in the agents' prompts.
 
 Nobody joins anything. The shared room is the only room both accounts are in, which on a homeserver where agents are power level 0 and `invite` is 100 is the only room either of them *can* post into — so it is also, for free, the one room where every message between agents is visible.
 
@@ -94,11 +96,12 @@ An addressed agent is not sandboxed by the tag. It reads everything in the room 
 | `model` | Passed to `--model`. Overwrites the session's model every turn, so `!model` does not stick in a configured room. |
 | `systemPrompt` / `systemPromptMode` | Appended to Claude Code's own prompt. `"replace"` replaces it, including its tool-use guidance. |
 | `replyInThread` | Open a thread on every top-level message here, giving each exchange its own session. |
-| `requireMention` / `mentionPatterns` | Answer only when addressed. A `<name>` block addressed to this agent always counts. |
+| `requireMention` / `mentionPatterns` | Answer only when addressed. A `<name>` block addressed to this agent always counts, and so does an answer from the addressee in a thread this agent relayed into, tagged or not. |
 | `allowBots` | Admit messages from senders not on the `humans` list, labelled `[Name]`. |
 | `humans` | MXIDs that count as human here. Falls back to `defaultHumans`; absent both, everyone is human. |
 | `relayRoom` | Where a block addressed to somebody not in this room is forwarded. |
 | `fetchHistory` | Prepend recent room messages to the prompt. Default true; off is usually what you want in a room with several speakers. |
+| `mcpConfig` | Path passed to `--mcp-config`. A claude.ai connector declared there as a `claudeai-proxy` server loads before the first model request instead of racing it. |
 | `disallowedTools` | Passed to `--disallowed-tools`, by name rather than as an allowlist, so a connector authenticated later cannot appear by surprise. |
 | `maxCostUsdPerTurn` / `maxCostUsdPerDay` | Per-turn `--max-budget-usd`; per-day total in memory, so a restart forgives the day. |
 | `sessionGroup` | Rooms sharing a group share one session. A thread overrides it. |
@@ -112,6 +115,7 @@ Top level: `rooms`, `defaults`, `defaultHumans`, `configuredRoomsOnly`.
 - `--session-id` must be a valid UUID, and the CLI only says so when a turn runs.
 - `--disallowed-tools` is variadic, so bare words after it are swallowed as further rules. A rule matching no known tool only warns — a typo silently grants what it meant to withhold.
 - `--permission-mode dontAsk` means don't ask, **deny**.
+- In `stream-json`, the `result` event carries only the **last** text block. A turn that says something, calls a tool, and says something else has `result` equal to the second thing. Collect the `assistant` events instead.
 - Deny rules apply under `bypassPermissions`; allow rules do not, because everything is already allowed.
 - `bypassPermissions` refuses to start as root. `IS_SANDBOX=1` clears it; `CLAUDE_CODE_IN_SANDBOX=1` does not.
 - `CLAUDE_CODE_OAUTH_TOKEN` beats `~/.claude/.credentials.json` and declares `user:inference` only, so a setup-token session can never see claude.ai connectors however many times you log in beside it. The gateway blanks it when a credentials file exists.

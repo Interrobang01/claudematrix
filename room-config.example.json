@@ -4,7 +4,7 @@
     "!YOUR_PRIVATE_ROOM:example.org": {
       "name": "myagent",
       "sessionId": "a827627d-4e33-4a15-b4ee-dda162f58c9e",
-      "systemPrompt": "You are reachable in this Matrix room. Your final assistant message is posted to the room exactly as written — there is no reply tool.",
+      "systemPrompt": "You are reachable in this Matrix room. Everything you write in a turn is posted to the room as one message, including text between tool calls — there is no reply tool.",
       "workingDirectory": "/path/to/your/working/directory",
       "model": "sonnet",
       "replyInThread": true,
