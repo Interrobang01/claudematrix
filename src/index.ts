@@ -1061,6 +1061,11 @@ const transport = new MatrixTransport(HOMESERVER_URL, ACCESS_TOKEN, STORAGE_PATH
 // localpart of its MXID. Filled in at startup, before any message is handled.
 let selfName = "";
 
+/** `@emet:synapse.example` → `emet`, which is also the name its tag uses. */
+function localpart(mxid: string): string {
+  return mxid.split(":")[0].replace(/^@/, "").toLowerCase();
+}
+
 // Matrix has no command registry, so these are plain text prefixes.
 const TEXT_COMMANDS = [
   ["!help", "Show available commands"],
@@ -1265,8 +1270,8 @@ async function runTurn(opts: {
 
   const previewState = createPreviewState();
   previewState.msg = replyTo
-    ? await replyTo.reply("⏳ *Thinking...*")
-    : await room.send("⏳ *Thinking...*");
+    ? await replyTo.reply("⏳ *Thinking...*", { notice: true })
+    : await room.send("⏳ *Thinking...*", { notice: true });
   await transport.setTyping(roomId, true);
 
   const baseSystemPrompt = agent?.systemPrompt ?? roomConfig.defaults?.systemPrompt ?? SYSTEM_PROMPT;
@@ -1349,7 +1354,7 @@ async function runTurn(opts: {
   } catch (err) {
     if (previewState.timer) clearTimeout(previewState.timer);
     if (previewState.msg) await previewState.msg.edit(`Error: ${(err as Error).message}`).catch(() => {});
-    else await room.send(`Error: ${(err as Error).message}`).catch(() => {});
+    else await room.send(`Error: ${(err as Error).message}`, { notice: true }).catch(() => {});
   } finally {
     await transport.setTyping(roomId, false);
     for (const p of opts.filePaths ?? []) fs.unlink(p, () => {});
@@ -1381,8 +1386,19 @@ transport.onMessage(async (msg) => {
       || matchesMentionPatterns(msg.content, agent)
       || addressesUs(msg.content, selfName);
 
+    // The answer to a block this agent relayed, from the sibling it was sent
+    // to, in the thread it opened. That is a reply whether or not it carries
+    // our tag. Requiring the tag here meant an answer written in plain text
+    // was posted, read by nobody, and never reported: the asker's turn had
+    // ended and nothing was waiting on it. A message tagged only to somebody
+    // else is that sibling moving on, and still does not wake us.
+    const answerTo = fromBot && msg.threadRootId ? lookupBridge(msg.threadRootId) : null;
+    const answersUs = !!answerTo
+      && localpart(msg.sender) === answerTo.addressee
+      && (isMentioned || relayBlocks(msg.content).length === 0);
+
     if (agent) {
-      if ((agent.requireMention ?? false) && !isMentioned) return;
+      if ((agent.requireMention ?? false) && !isMentioned && !answersUs) return;
     } else if (isMentioned) {
       // A mention in a room with no config. Whether that is a feature or a hole
       // in a boundary depends on the deployment, so it is a setting.
@@ -1442,7 +1458,7 @@ transport.onMessage(async (msg) => {
     if (budget.over) {
       console.log(`[matrix-cc-bot] daily budget spent in ${turnRoomId}: $${budget.spent.toFixed(2)} of $${budget.cap.toFixed(2)}`);
       if (budget.announce) {
-        await room.send(`💸 *Daily budget reached ($${budget.spent.toFixed(2)} of $${budget.cap.toFixed(2)}). Quiet until UTC midnight.*`).catch(() => {});
+        await room.send(`💸 *Daily budget reached ($${budget.spent.toFixed(2)} of $${budget.cap.toFixed(2)}). Quiet until UTC midnight.*`, { notice: true }).catch(() => {});
       }
       return;
     }
@@ -1468,7 +1484,7 @@ transport.onMessage(async (msg) => {
     // being dropped on the floor — it is told so, in the thread it came from.
     if (entry.awaitingAnswer && !msg.isHuman) {
       console.log(`[matrix-cc-bot] ${threadId} is awaiting a confirmation — not taking a relayed turn`);
-      await room.send("*Waiting on Terry. Nothing here will be read until he answers.*").catch(() => {});
+      await room.send("*Waiting on Terry. Nothing here will be read until he answers.*", { notice: true }).catch(() => {});
       return;
     }
     if (entry.awaitingAnswer && msg.isHuman) {
@@ -1559,7 +1575,7 @@ process.on("SIGTERM", shutdown);
 
 (async () => {
   const { userId, displayName } = await transport.start();
-  selfName = userId.split(":")[0].replace(/^@/, "").toLowerCase();
+  selfName = localpart(userId);
   console.log(`[matrix-cc-bot] ready as ${userId} ("${displayName}") on ${HOMESERVER_URL}`);
   console.log(
     `[matrix-cc-bot] auth: ${hasStoredCredentials()

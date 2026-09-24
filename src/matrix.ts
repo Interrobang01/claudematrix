@@ -27,13 +27,19 @@ export type Msg = {
   id: string;
   roomId: string;
   edit(text: string): Promise<void>;
-  reply(text: string): Promise<Msg>;
+  reply(text: string, opts?: SendOpts): Promise<Msg>;
   delete(): Promise<void>;
 };
 
+/** `notice` sends `m.notice` rather than `m.text`: the gateway talking about a
+ *  turn rather than the agent taking one. By Matrix convention bots do not act
+ *  on notices, and this transport drops them on the way in, so a placeholder or
+ *  a status line can never wake a sibling. */
+export type SendOpts = { notice?: boolean };
+
 export type Room = {
   id: string;
-  send(content: string | { content: string }): Promise<Msg>;
+  send(content: string | { content: string }, opts?: SendOpts): Promise<Msg>;
 };
 
 export type IncomingMessage = {
@@ -91,9 +97,9 @@ function escapeHtml(s: string): string {
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
 }
 
-function messageBody(text: string): Record<string, any> {
+function messageBody(text: string, opts?: SendOpts): Record<string, any> {
   return {
-    msgtype: "m.text",
+    msgtype: opts?.notice ? "m.notice" : "m.text",
     body: text,
     format: "org.matrix.custom.html",
     formatted_body: renderHtml(text),
@@ -221,9 +227,9 @@ export class MatrixTransport {
   room(roomId: string, threadRootId?: string): Room {
     return {
       id: roomId,
-      send: async (content) => {
+      send: async (content, opts) => {
         const text = typeof content === "string" ? content : content.content;
-        const inner = messageBody(text);
+        const inner = messageBody(text, opts);
         const eventId = threadRootId
           ? await this.client.sendEvent(roomId, "m.room.message", { ...inner, ...threadRelation(threadRootId) })
           : await this.client.sendMessage(roomId, inner);
@@ -245,8 +251,8 @@ export class MatrixTransport {
           "m.relates_to": { rel_type: "m.replace", event_id: eventId },
         });
       },
-      reply: async (text) => {
-        const inner = messageBody(text);
+      reply: async (text, opts) => {
+        const inner = messageBody(text, opts);
         const id = await this.client.sendEvent(roomId, "m.room.message", {
           ...inner,
           ...(threadRootId
