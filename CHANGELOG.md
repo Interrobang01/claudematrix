@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.1 - 2026-09-23
+
+### Fixed
+- **A block containing a backtick was invisible.** Tags were matched on each
+  piece of text between code spans separately, so `<oman>Done: `/x`</oman>`
+  had its opening and closing tag in different pieces and matched nothing — a
+  correctly tagged answer was dropped at the mention gate, and a request with a
+  path or command in it would never have been forwarded. Code spans are now
+  blanked in a same-length copy and tags found there. This, not a missing tag,
+  was the cause of the 2026-09-22 lost answer that 1.1.0 attributed to an
+  untagged reply; 1.1.0's routing change stands as a second line of defence.
+
 ## 1.1.0 - 2026-09-23
 
 ### Fixed

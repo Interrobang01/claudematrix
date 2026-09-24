@@ -44,41 +44,48 @@ function isAgentName(name: string): boolean {
 
 export type RelayBlock = { to: string; body: string };
 
-/** Split on fenced code and inline code so a tag inside either is left alone.
- *  An agent pasting `<emet>` into a code block is showing somebody the syntax,
- *  not using it. */
-function outsideCode(text: string, fn: (chunk: string) => string): string {
-  const parts = text.split(/(```[\s\S]*?```|`[^`\n]*`)/g);
-  return parts.map((p, i) => (i % 2 === 1 ? p : fn(p))).join("");
+const CODE = /```[\s\S]*?```|`[^`\n]*`/g;
+
+type TagMatch = { start: number; end: number; name: string; body: string };
+
+/** Every `<name>...</name>` in `text` whose tags are outside code. An agent
+ *  pasting `<emet>` into a code block is showing somebody the syntax, not
+ *  using it — but code *inside* a block is ordinary content, and the block
+ *  still counts.
+ *
+ *  Code spans are blanked in a same-length copy and the tags are found there,
+ *  so positions line up and the body is sliced from the original. This used to
+ *  split the text at code spans and match each piece on its own, which made any
+ *  block containing a backtick invisible: `<oman>Done: `/srv/x.md`</oman>` has
+ *  its opening and closing tags in different pieces. That silently dropped a
+ *  correctly tagged answer on 2026-09-22 and would have refused to forward any
+ *  request with a path or a command in it. */
+function tagMatches(text: string): TagMatch[] {
+  const masked = text.replace(CODE, (m) => m.replace(/[^\n]/g, "\u0000"));
+  const out: TagMatch[] = [];
+  for (const m of masked.matchAll(RELAY_TAG)) {
+    const name = m[1].toLowerCase();
+    if (!isAgentName(name)) continue;
+    const start = m.index!;
+    const end = start + m[0].length;
+    const body = text.slice(start + m[1].length + 2, end - m[1].length - 3);
+    out.push({ start, end, name, body });
+  }
+  return out;
 }
 
 /** Every block in `text`, in order. `self` is this agent's own name: a block
  *  addressed to itself is a note to self and is never routed anywhere. */
 export function relayBlocks(text: string, self?: string): RelayBlock[] {
-  const out: RelayBlock[] = [];
-  outsideCode(text, (chunk) => {
-    for (const m of chunk.matchAll(RELAY_TAG)) {
-      const to = m[1].toLowerCase();
-      const body = m[2].trim();
-      if (body && to !== self && isAgentName(to)) out.push({ to, body });
-    }
-    return chunk;
-  });
-  return out;
+  return tagMatches(text)
+    .map((t) => ({ to: t.name, body: t.body.trim() }))
+    .filter((b) => b.body && b.to !== self);
 }
 
 /** True when `text` carries a block addressed to `self`. This is a mention:
  *  it is how a sibling wakes this agent in a room they share. */
 export function addressesUs(text: string, self: string): boolean {
-  let found = false;
-  outsideCode(text, (chunk) => {
-    for (const m of chunk.matchAll(RELAY_TAG)) {
-      const name = m[1].toLowerCase();
-      if (name === self && isAgentName(name) && m[2].trim()) found = true;
-    }
-    return chunk;
-  });
-  return found;
+  return tagMatches(text).some((t) => t.name === self && t.body.trim() !== "");
 }
 
 /** Matrix clients sanitize incoming HTML against the spec's allowed-tag list,
@@ -87,10 +94,12 @@ export function addressesUs(text: string, self: string): boolean {
  *  Rendering it as a labelled quote instead keeps the two consistent and keeps
  *  the routing visible to the person reading the room. */
 export function markRelayTags(text: string): string {
-  return outsideCode(text, (chunk) =>
-    chunk.replace(RELAY_TAG, (m, name: string, body: string) => {
-      if (!isAgentName(name.toLowerCase())) return m;
-      const quoted = body.trim().replace(/\n/g, "\n> ");
-      return `\n> **→ ${name}**\n> ${quoted}\n`;
-    }));
+  let out = "";
+  let at = 0;
+  for (const t of tagMatches(text)) {
+    const quoted = t.body.trim().replace(/\n/g, "\n> ");
+    out += text.slice(at, t.start) + `\n> **→ ${t.name}**\n> ${quoted}\n`;
+    at = t.end;
+  }
+  return out + text.slice(at);
 }
