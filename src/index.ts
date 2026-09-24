@@ -751,6 +751,12 @@ type RoomConfig = {
    *  tool that becomes available later cannot appear in a turn by surprise; and a
    *  flag rather than a deny rule, so the schema stays out of the prompt too. */
   disallowedTools?: string[];
+  /** Passed to the CLI as --mcp-config. A server declared here resolves inside
+   *  the awaited startup path; a claude.ai connector is fetched asynchronously
+   *  and can lose the race with the first model request, leaving that turn with
+   *  no connector tools and no error anywhere. Declaring the connector as a
+   *  `claudeai-proxy` server pins it into the awaited path. */
+  mcpConfig?: string;
   /** Start a thread on every top-level message here, so each exchange gets its
    *  own bounded session. Off by default, which leaves the room behaving exactly
    *  as it did: threads are then opt-in, and Terry starts one by hand when he
@@ -1279,6 +1285,7 @@ async function runTurn(opts: {
     systemPromptMode: resolveSystemPromptMode(agent),
     maxBudgetUsd: agent?.maxCostUsdPerTurn,
     disallowedTools: agent?.disallowedTools,
+    mcpConfig: agent?.mcpConfig,
     callbacks: {
       onText: (fullText: string) => handleStreamText(previewState, fullText),
       onToolUse: createToolUseHandler(previewState),
