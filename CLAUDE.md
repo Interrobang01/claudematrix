@@ -54,9 +54,11 @@ room message → gating → session key → claude -p --resume <uuid> → messag
   `result` is only the last block, so posting it drops whatever the model said
   before its last tool call. `NO_RESPONSE` is judged on the last block alone.
 - **Anything the gateway says about a turn is `m.notice`.** The transport drops
-  notices on the way in, and in a bridged thread every `m.text` from the
-  addressee is routed home as an answer — so a placeholder or status line sent
-  as `m.text` would wake the sibling that asked.
+  notices on the way in, so a placeholder or status line can never be read
+  as a turn by a sibling sharing the room.
+- **Only a tagged message is routed home from a bridged thread.** A bridge row
+  lives as long as its thread, so "untagged from the addressee counts" (1.1.0)
+  also caught the addressee answering Terry there. Removed in 1.1.2.
 - **Verify behaviour, not the config value.** This codebase has a history of
   keys that were read by nothing (`replyInThread` sat inert in the config for
   months) and of configs that silently failed to load. New config keys need a

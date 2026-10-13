@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.2 - 2026-10-13
+
+### Fixed
+- **A sibling's answer to Terry was routed to the agent that relayed.** 1.1.0
+  routed any untagged message from the addressee in a bridged thread home, and
+  a bridge row never expires, so once Terry spoke in the thread the sibling's
+  reply to *him* also went home. Removed: an answer routes home only when it
+  carries the asker's tag. The prompts tell agents to tag answers.
+
 ## 1.1.1 - 2026-09-23
 
 ### Fixed

@@ -1386,19 +1386,12 @@ transport.onMessage(async (msg) => {
       || matchesMentionPatterns(msg.content, agent)
       || addressesUs(msg.content, selfName);
 
-    // The answer to a block this agent relayed, from the sibling it was sent
-    // to, in the thread it opened. That is a reply whether or not it carries
-    // our tag. Requiring the tag here meant an answer written in plain text
-    // was posted, read by nobody, and never reported: the asker's turn had
-    // ended and nothing was waiting on it. A message tagged only to somebody
-    // else is that sibling moving on, and still does not wake us.
-    const answerTo = fromBot && msg.threadRootId ? lookupBridge(msg.threadRootId) : null;
-    const answersUs = !!answerTo
-      && localpart(msg.sender) === answerTo.addressee
-      && (isMentioned || relayBlocks(msg.content).length === 0);
-
+    // An answer to a block this agent relayed must carry our tag like any other
+    // message. 1.1.0 routed a sibling's untagged message home too, but a bridge
+    // row lives as long as its thread, so once Terry joined the thread the
+    // sibling's answers *to him* went home as well. Untagged is now not for us.
     if (agent) {
-      if ((agent.requireMention ?? false) && !isMentioned && !answersUs) return;
+      if ((agent.requireMention ?? false) && !isMentioned) return;
     } else if (isMentioned) {
       // A mention in a room with no config. Whether that is a feature or a hole
       // in a boundary depends on the deployment, so it is a setting.
