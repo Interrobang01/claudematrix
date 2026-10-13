@@ -76,6 +76,8 @@ const stmtBridgePut = db.prepare(
    VALUES (@relayRootId, @homeRoomId, @homeThreadRootId, @homeThreadId, @addressee, @hops, @createdAt)`,
 );
 const stmtBridgeHop = db.prepare("UPDATE bridge SET hops = hops + 1 WHERE relayRootId = ?");
+db.exec("CREATE INDEX IF NOT EXISTS bridge_home ON bridge (homeThreadId)");
+const stmtBridgeByHome = db.prepare("SELECT * FROM bridge WHERE homeThreadId = ? ORDER BY createdAt LIMIT 1");
 
 type Bridge = {
   relayRootId: string;
@@ -1236,7 +1238,19 @@ async function forwardRelayBlocks(
       // Posted verbatim, tag included: it is what wakes the addressee on the
       // other side, and it is what tells a reader of the shared room who the
       // message is for.
-      const root = await transport.room(relayRoomId).send(`<${block.to}>${block.body}</${block.to}>`);
+      const tagged = `<${block.to}>${block.body}</${block.to}>`;
+
+      // One conversation here is one thread there. A second block from the same
+      // home thread joins the shared-room thread the first one opened, so the
+      // sibling answers in the session it already has instead of starting cold.
+      const existing = stmtBridgeByHome.get(ctx.threadId) as Bridge | undefined;
+      if (existing) {
+        await transport.room(relayRoomId, existing.relayRootId).send(tagged);
+        console.log(`[matrix-cc-bot] relayed to ${block.to} → ${relayRoomId} thread ${existing.relayRootId.slice(0, 8)}… (home ${ctx.threadId})`);
+        continue;
+      }
+
+      const root = await transport.room(relayRoomId).send(tagged);
       stmtBridgePut.run({
         relayRootId: root.id,
         homeRoomId: ctx.roomId,

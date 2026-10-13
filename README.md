@@ -57,8 +57,8 @@ The tag names the **addressee**. Who *wrote* a message is the `[Name]` prefix th
 In a room both parties are already in, the tag is only a wake signal — it routes the message the way a mention does. A room with `relayRoom` set also **forwards** the block into that room, which is how an agent reaches a sibling who is not here:
 
 1. You and `oman` are talking in `oman`'s own room, in a thread.
-2. `oman` writes `<emet>…</emet>`. The block — and only the block, never the rest of the turn — is posted into the shared room, and a row in the `bridge` table remembers which thread it came from.
-3. `emet` is in the shared room. The tag wakes it, and its reply opens a thread on the relayed message. It should answer with `<oman>…</oman>`, but a reply in that thread with no tag at all counts too.
+2. `oman` writes `<emet>…</emet>`. The block — and only the block, never the rest of the turn — is posted into the shared room, and a row in the `bridge` table remembers which thread it came from. Later blocks from the same thread go into the same shared-room thread, so one conversation stays one conversation on both sides.
+3. `emet` is in the shared room. The tag wakes it, and its reply opens a thread on the relayed message. It answers with `<oman>…</oman>`; an untagged reply in that thread is for whoever else is reading, and is not routed back.
 4. `oman`'s gateway recognises the thread, posts `emet`'s answer into the original thread labelled `[Emet]`, and runs the next turn in **that** session.
 
 What does **not** come back: a reply tagged only to a third agent, a reply posted outside the thread, and a turn that ends in `NO_RESPONSE`. None of these errors or times out — the asker's turn ended when it asked, and nothing is waiting — so they are posted, readable in the shared room, and received by nobody. Say so in the agents' prompts.
@@ -96,7 +96,7 @@ An addressed agent is not sandboxed by the tag. It reads everything in the room 
 | `model` | Passed to `--model`. Overwrites the session's model every turn, so `!model` does not stick in a configured room. |
 | `systemPrompt` / `systemPromptMode` | Appended to Claude Code's own prompt. `"replace"` replaces it, including its tool-use guidance. |
 | `replyInThread` | Open a thread on every top-level message here, giving each exchange its own session. |
-| `requireMention` / `mentionPatterns` | Answer only when addressed. A `<name>` block addressed to this agent always counts, and so does an answer from the addressee in a thread this agent relayed into, tagged or not. |
+| `requireMention` / `mentionPatterns` | Answer only when addressed. A `<name>` block addressed to this agent always counts, as do a pill and `m.mentions`. The agent's name in plain text does not. |
 | `allowBots` | Admit messages from senders not on the `humans` list, labelled `[Name]`. |
 | `humans` | MXIDs that count as human here. Falls back to `defaultHumans`; absent both, everyone is human. |
 | `relayRoom` | Where a block addressed to somebody not in this room is forwarded. |

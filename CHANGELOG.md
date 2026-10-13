@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0 - 2026-10-13
+
+### Changed
+- **One home thread relays into one shared-room thread.** Every `<name>` block
+  used to open a new thread in the shared room, so an agent asking a sibling
+  three things from one conversation produced three threads and three cold
+  sibling sessions. Later blocks from the same home thread now post into the
+  thread the first one opened, whoever they are addressed to.
+
 ## 1.1.4 - 2026-10-13
 
 ### Changed
