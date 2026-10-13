@@ -201,7 +201,7 @@ export class MatrixTransport {
           // sender as human — the fail-safe direction, since the bot-turn
           // budget only ever suppresses turns.
           isHuman: humans ? humans.has(event.sender) : true,
-          mentionsUs: this.mentionsUs(event, body),
+          mentionsUs: this.mentionsUs(event),
           attachments,
         }).catch((err) => console.error("[matrix-cc-bot] handler error:", err));
       } catch (err) {
@@ -210,16 +210,15 @@ export class MatrixTransport {
     });
   }
 
-  private mentionsUs(event: any, body: string): boolean {
+  private mentionsUs(event: any): boolean {
     // The spec's intentional-mentions field, when the sender sets it.
     const m = event.content?.["m.mentions"]?.user_ids;
     if (Array.isArray(m) && m.includes(this.userId)) return true;
     // A pill in formatted_body is an <a href="https://matrix.to/#/@user:server">.
     const fb: string = event.content?.formatted_body ?? "";
-    if (fb.includes(`/#/${this.userId}`)) return true;
-    // Plain text, which is how one bot addresses another — no pill involved.
-    if (this.displayName && new RegExp(`(^|\\s)@?${escapeRegex(this.displayName)}\\b`, "i").test(body)) return true;
-    return new RegExp(`(^|\\s)@?${escapeRegex(this.userId.split(":")[0].slice(1))}\\b`, "i").test(body);
+    // Not the name in plain text: that woke an agent whenever a sibling merely
+    // talked about it. Agents address each other with a `<name>` tag instead.
+    return fb.includes(`/#/${this.userId}`);
   }
 
   /** `threadRootId` puts everything this Room sends inside that thread. Absent,
@@ -275,8 +274,4 @@ export class MatrixTransport {
     fs.mkdirSync(path.dirname(filepath), { recursive: true });
     fs.writeFileSync(filepath, res.data);
   }
-}
-
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

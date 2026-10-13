@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.4 - 2026-10-13
+
+### Changed
+- **A name in plain text is no longer a mention.** `oman` or `@oman` in a
+  message body woke that agent, so a sibling saying "oman asked me" in the
+  commons started a turn nobody addressed. A mention is now `m.mentions`, a
+  pill, a `<name>` tag, or an explicit `mentionPatterns` entry.
+
 ## 1.1.3 - 2026-10-13
 
 ### Changed
