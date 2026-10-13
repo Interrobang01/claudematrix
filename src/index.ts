@@ -1324,8 +1324,11 @@ async function runTurn(opts: {
     // silence is what ends an exchange gracefully; the budget is the other way.
     // Judged on the last block: a turn that says "let me check", looks, and then
     // decides there is nothing to add has decided, and the narration goes too.
+    // The placeholder becomes a notice saying so rather than vanishing: from the
+    // room, a deliberate silence and a broken gateway looked identical. Notices
+    // are dropped on the way in, so this wakes nobody.
     if (result.finalText.trim().startsWith(SILENT_TOKEN)) {
-      await previewState.msg!.delete().catch(() => {});
+      await previewState.msg!.edit(`🤐 *${selfName}: no response*`, { notice: true }).catch(() => {});
       entry.started = true;
       saveEntry(threadId, entry);
       console.log(`[matrix-cc-bot] ${SILENT_TOKEN} in ${threadId} — nothing posted`);

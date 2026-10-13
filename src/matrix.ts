@@ -26,7 +26,7 @@ export const MATRIX_MAX_LEN = 16000;
 export type Msg = {
   id: string;
   roomId: string;
-  edit(text: string): Promise<void>;
+  edit(text: string, opts?: SendOpts): Promise<void>;
   reply(text: string, opts?: SendOpts): Promise<Msg>;
   delete(): Promise<void>;
 };
@@ -242,8 +242,8 @@ export class MatrixTransport {
     return {
       id: eventId,
       roomId,
-      edit: async (text) => {
-        const inner = messageBody(text);
+      edit: async (text, opts) => {
+        const inner = messageBody(text, opts);
         await this.client.sendEvent(roomId, "m.room.message", {
           ...inner,
           body: "* " + inner.body,

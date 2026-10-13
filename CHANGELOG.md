@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.3 - 2026-10-13
+
+### Changed
+- **`NO_RESPONSE` leaves a trace.** The `Thinking...` placeholder used to be
+  redacted, so from the room a deliberate silence looked exactly like a broken
+  gateway. It is now edited into an `m.notice` reading `🤐 <name>: no
+  response`, which no gateway reads as a turn. `Msg.edit` takes `{ notice }`.
+
 ## 1.1.2 - 2026-10-13
 
 ### Fixed
