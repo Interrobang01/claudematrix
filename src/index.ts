@@ -933,7 +933,10 @@ preloadContextFiles();
 warnOnBadSessionIds();
 
 // Watch for config changes and reload
-for (const f of CONFIG_PATHS) fs.watchFile(f, { interval: 5000 }, () => {
+for (const f of CONFIG_PATHS) fs.watchFile(f, { interval: 5000 }, (curr) => {
+  // A watched file that does not exist reports once anyway, with zeroed stats;
+  // the old `channel-config.json` name did that at every startup.
+  if (curr.mtimeMs === 0) return;
   console.log(`[matrix-cc-bot] reloading ${path.basename(f)}`);
   roomConfig = loadRoomConfig();
   preloadContextFiles();
