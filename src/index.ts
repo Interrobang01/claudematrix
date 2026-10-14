@@ -938,6 +938,9 @@ for (const f of CONFIG_PATHS) fs.watchFile(f, { interval: 5000 }, () => {
   roomConfig = loadRoomConfig();
   preloadContextFiles();
   warnOnBadSessionIds();
+  // Schedules are armed from the config, so a changed one needs re-arming;
+  // before this, editing a schedule silently did nothing until a restart.
+  startScheduledJobs();
 });
 
 function getRoomAgent(roomId: string): RoomConfig | null {

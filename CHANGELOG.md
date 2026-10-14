@@ -13,6 +13,10 @@
   leaves no transcript, so it never triggers itself. Last-run times are in a
   `schedule_runs` table and advance only on success.
 
+### Fixed
+- **Editing a schedule did nothing until a restart.** The config hot-reload
+  never re-armed cron jobs; it does now.
+
 ## 1.4.0 - 2026-10-13
 
 ### Added
