@@ -98,7 +98,7 @@ Before 1.4.0 agents addressed each other by writing `<emet>…</emet>` in their 
 | `mcpConfig` | Path passed to `--mcp-config`. A claude.ai connector declared there as a `claudeai-proxy` server loads before the first model request instead of racing it. |
 | `disallowedTools` | Passed to `--disallowed-tools`, by name rather than as an allowlist, so a connector authenticated later cannot appear by surprise. |
 | `sessionGroup` | Rooms sharing a group share one session. A thread overrides it. |
-| `schedule` | `{ cron, timezone, prompt }` for a scheduled turn. |
+| `schedule` | `{ cron, timezone, prompt }` for a scheduled turn, or a list of them. `name` keys the job; `fresh: true` gives each firing a new, unpersisted session; `newTranscripts: <dir>` fires only if a `*.jsonl` there changed since the job last succeeded, and lists the changed files at the end of the prompt. |
 | `contextFile` | A file prepended to the system prompt, hot-reloaded with the config. |
 
 Top level: `rooms`, `defaults`, `defaultHumans`, `configuredRoomsOnly`.

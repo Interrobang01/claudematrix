@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.5.0 - 2026-10-13
+
+### Added
+- **Several schedules per room.** `schedule` takes a list.
+- **`fresh: true`** on a schedule: each firing gets a new session run with
+  `--no-session-persistence`, instead of accumulating in the room's session.
+- **`newTranscripts: <dir>`** on a schedule: the job fires only if a `*.jsonl`
+  in that directory changed since it last succeeded (first run: the last 24
+  hours), and the changed files are appended to the prompt. Built for a
+  nightly pass that writes down what finished threads learned. A fresh job
+  leaves no transcript, so it never triggers itself. Last-run times are in a
+  `schedule_runs` table and advance only on success.
+
 ## 1.4.0 - 2026-10-13
 
 ### Added

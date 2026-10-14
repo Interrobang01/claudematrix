@@ -103,6 +103,10 @@ const stmtPendingPut = db.prepare(
 const stmtPendingClear = db.prepare("DELETE FROM pending WHERE relayRootId = ? AND toName = ?");
 const stmtPendingDue = db.prepare("SELECT * FROM pending WHERE deadline <= ? ORDER BY deadline");
 
+db.exec("CREATE TABLE IF NOT EXISTS schedule_runs (key TEXT PRIMARY KEY, lastRun INTEGER NOT NULL)");
+const stmtRunGet = db.prepare("SELECT lastRun FROM schedule_runs WHERE key = ?");
+const stmtRunPut = db.prepare("INSERT OR REPLACE INTO schedule_runs (key, lastRun) VALUES (?, ?)");
+
 type Pending = {
   relayRootId: string;
   toName: string;
@@ -358,6 +362,8 @@ function runClaudeStreaming(opts: {
   systemPromptMode?: SystemPromptMode;
   disallowedTools?: string[];
   mcpConfigs?: string[];
+  /** False: `--no-session-persistence`, so the turn leaves no transcript. */
+  persist?: boolean;
   timeoutMs?: number;
   callbacks?: StreamCallbacks;
 }): Promise<RunResult> {
@@ -365,6 +371,7 @@ function runClaudeStreaming(opts: {
     const args = [
       "-p", opts.prompt,
       ...(opts.resume ? ["--resume", opts.sessionId] : ["--session-id", opts.sessionId]),
+      ...(opts.persist === false ? ["--no-session-persistence"] : []),
       "--model", opts.model,
       "--dangerously-skip-permissions",
       "--output-format", "stream-json",
@@ -736,6 +743,15 @@ type RoomSchedule = {
   cron: string;
   prompt: string;
   timezone?: string;
+  /** Names the job in the log and keys its last-run time. Defaults to `cron`. */
+  name?: string;
+  /** A new session for every firing, not persisted, posted at the top level.
+   *  Without it a job runs in the room's own session and accumulates context. */
+  fresh?: boolean;
+  /** A directory of Claude Code transcripts. The job fires only if a `*.jsonl`
+   *  in it changed since the job last succeeded, and the changed files are
+   *  listed at the end of the prompt. */
+  newTranscripts?: string;
 };
 
 type SystemPromptMode = "append" | "replace";
@@ -747,7 +763,7 @@ type RoomConfig = {
   systemPromptMode?: SystemPromptMode;
   workingDirectory?: string;
   model?: string;
-  schedule?: RoomSchedule;
+  schedule?: RoomSchedule | RoomSchedule[];
   contextFile?: string;
   /** Answer only when mentioned. Default false — a configured room replies to everything. */
   requireMention?: boolean;
@@ -1161,46 +1177,82 @@ async function handleCommand(msg: IncomingMessage, room: Room, threadId: string)
 
 const scheduledTasks: cron.ScheduledTask[] = [];
 
+/** `*.jsonl` directly in `dir` modified after `since`, oldest first. */
+function changedTranscripts(dir: string, since: number): string[] {
+  let names: string[];
+  try { names = fs.readdirSync(dir); } catch { return []; }
+  return names
+    .filter((n) => n.endsWith(".jsonl"))
+    .map((n) => path.join(dir, n))
+    .map((f) => ({ f, m: fs.statSync(f).mtimeMs }))
+    .filter(({ m }) => m > since)
+    .sort((a, b) => a.m - b.m)
+    .map(({ f }) => f);
+}
+
 function startScheduledJobs(): void {
   for (const task of scheduledTasks) task.stop();
   scheduledTasks.length = 0;
 
   for (const [roomId, cfg] of Object.entries(roomConfig.rooms)) {
-    if (!cfg.schedule) continue;
-    const { cron: cronExpr, prompt, timezone } = cfg.schedule;
-    if (!cron.validate(cronExpr)) {
-      console.error(`[matrix-cc-bot] invalid cron for "${cfg.name}": ${cronExpr}`);
-      continue;
+    const jobs = cfg.schedule ? (Array.isArray(cfg.schedule) ? cfg.schedule : [cfg.schedule]) : [];
+    for (const job of jobs) {
+      const { cron: cronExpr, timezone } = job;
+      const jobName = `${cfg.name}/${job.name ?? cronExpr}`;
+      if (!cron.validate(cronExpr)) {
+        console.error(`[matrix-cc-bot] invalid cron for "${jobName}": ${cronExpr}`);
+        continue;
+      }
+      console.log(`[matrix-cc-bot] scheduling "${jobName}" → "${cronExpr}"${timezone ? ` (${timezone})` : ""}${job.fresh ? " fresh" : ""}${job.newTranscripts ? ` if-new:${job.newTranscripts}` : ""}`);
+
+      const task = cron.schedule(cronExpr, async () => {
+        const runKey = `${roomId}:${job.name ?? cronExpr}`;
+        const startedAt = Date.now();
+        let prompt = job.prompt;
+
+        // Nothing new to read is nothing to do: no turn, no spend, no notice.
+        if (job.newTranscripts) {
+          const last = (stmtRunGet.get(runKey) as { lastRun: number } | undefined)?.lastRun
+            ?? startedAt - 24 * 3600_000;
+          const files = changedTranscripts(job.newTranscripts, last);
+          if (!files.length) {
+            console.log(`[matrix-cc-bot] cron: ${jobName} — no transcripts changed since ${new Date(last).toISOString()}, skipping`);
+            return;
+          }
+          prompt += `\n\nTranscripts changed since ${new Date(last).toISOString()}:\n${files.map((f) => `- ${f}`).join("\n")}`;
+        }
+        console.log(`[matrix-cc-bot] cron fired for ${jobName}`);
+
+        const room = transport.room(roomId);
+        const threadId = job.fresh ? `cron:${runKey}:${startedAt}` : sessionKey(roomId, cfg);
+        const entry = getOrCreate(threadMap, threadId,
+          cfg.workingDirectory ?? roomConfig.defaults?.workingDirectory ?? DEFAULT_CWD,
+          job.fresh ? undefined : cfg.sessionId);
+        if (job.fresh) entry.model = cfg.model ?? roomConfig.defaults?.model ?? entry.model;
+
+        // Cron takes the same lane as a message: `running` only fills once a child
+        // has spawned, so checking it alone races a turn that is still starting.
+        const release = await acquireTurn(entry.sessionId);
+        if (!release) {
+          console.log(`[matrix-cc-bot] cron: ${jobName} session busy, skipping this firing`);
+          return;
+        }
+        try {
+          const ok = await runTurn({
+            room, roomId, threadId, entry, agent: cfg,
+            prompt, replyTo: undefined, persist: job.fresh ? false : undefined,
+          });
+          // A failed run leaves the mark where it was, so the next one rereads.
+          if (ok) stmtRunPut.run(runKey, startedAt);
+        } catch (err) {
+          console.error(`[matrix-cc-bot] cron error for ${jobName}:`, (err as Error).message);
+        } finally {
+          release();
+        }
+      }, timezone ? { timezone } : undefined);
+
+      scheduledTasks.push(task);
     }
-    console.log(`[matrix-cc-bot] scheduling "${cfg.name}" → "${cronExpr}"${timezone ? ` (${timezone})` : ""}`);
-
-    const task = cron.schedule(cronExpr, async () => {
-      console.log(`[matrix-cc-bot] cron fired for ${cfg.name}`);
-      const room = transport.room(roomId);
-      const threadId = sessionKey(roomId, cfg);
-      const entry = getOrCreate(threadMap, threadId,
-        cfg.workingDirectory ?? roomConfig.defaults?.workingDirectory ?? DEFAULT_CWD, cfg.sessionId);
-
-      // Cron takes the same lane as a message: `running` only fills once a child
-      // has spawned, so checking it alone races a turn that is still starting.
-      const release = await acquireTurn(entry.sessionId);
-      if (!release) {
-        console.log(`[matrix-cc-bot] cron: ${cfg.name} session busy, skipping this firing`);
-        return;
-      }
-      try {
-        await runTurn({
-          room, roomId, threadId, entry, agent: cfg,
-          prompt, replyTo: undefined,
-        });
-      } catch (err) {
-        console.error(`[matrix-cc-bot] cron error for ${cfg.name}:`, (err as Error).message);
-      } finally {
-        release();
-      }
-    }, timezone ? { timezone } : undefined);
-
-    scheduledTasks.push(task);
   }
   if (scheduledTasks.length) console.log(`[matrix-cc-bot] started ${scheduledTasks.length} scheduled job(s)`);
 }
@@ -1406,7 +1458,8 @@ async function firePendingDeadlines(): Promise<void> {
 
 // --- One turn ---
 
-/** Runs Claude for one turn and delivers the result. Shared by messages and cron. */
+/** Runs Claude for one turn and delivers the result. Shared by messages and cron.
+ *  Resolves false when the turn failed; the failure has already been posted. */
 async function runTurn(opts: {
   room: Room;
   roomId: string;
@@ -1416,7 +1469,8 @@ async function runTurn(opts: {
   prompt: string;
   replyTo?: Msg;
   filePaths?: string[];
-}): Promise<void> {
+  persist?: boolean;
+}): Promise<boolean> {
   const { room, roomId, threadId, entry, agent, prompt, replyTo } = opts;
 
   const previewState = createPreviewState();
@@ -1456,6 +1510,7 @@ async function runTurn(opts: {
     systemPromptMode: resolveSystemPromptMode(agent),
     disallowedTools: agent?.disallowedTools,
     mcpConfigs,
+    persist: opts.persist,
     callbacks: {
       onText: (fullText: string) => handleStreamText(previewState, fullText),
       onSegment: (text: string) => {
@@ -1484,7 +1539,7 @@ async function runTurn(opts: {
       await previewState.msg!.delete().catch(() => {});
       entry.started = true;
       await sendAskPrompt(room, threadId, entry, askDenial);
-      return;
+      return true;
     }
 
     // The model declined to speak. In a room where agents hear each other,
@@ -1499,7 +1554,7 @@ async function runTurn(opts: {
       entry.started = true;
       saveEntry(threadId, entry);
       console.log(`[matrix-cc-bot] ${SILENT_TOKEN} in ${threadId} — nothing posted`);
-      return;
+      return true;
     }
 
     entry.started = true;
@@ -1520,10 +1575,12 @@ async function runTurn(opts: {
     entry.lastBotMessageId = botReply.id;
     saveEntry(threadId, entry);
 
+    return true;
   } catch (err) {
     if (previewState.timer) clearTimeout(previewState.timer);
     if (previewState.msg) await previewState.msg.edit(`Error: ${(err as Error).message}`).catch(() => {});
     else await room.send(`Error: ${(err as Error).message}`, { notice: true }).catch(() => {});
+    return false;
   } finally {
     turnTokens.delete(turnToken);
     await relayed;
