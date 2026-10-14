@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import http from "node:http";
 import { spawn, type ChildProcess } from "node:child_process";
 import Database from "better-sqlite3";
 import cron from "node-cron";
@@ -78,6 +79,38 @@ const stmtBridgePut = db.prepare(
 const stmtBridgeHop = db.prepare("UPDATE bridge SET hops = hops + 1 WHERE relayRootId = ?");
 db.exec("CREATE INDEX IF NOT EXISTS bridge_home ON bridge (homeThreadId)");
 const stmtBridgeByHome = db.prepare("SELECT * FROM bridge WHERE homeThreadId = ? ORDER BY createdAt LIMIT 1");
+
+// A message sent with the `message` tool that expects an answer. The sender's
+// turn has ended by the time anyone could answer, so something that outlives
+// the turn has to promise it will be woken: either the answer arrives (which
+// starts a turn on its own) or the deadline passes and the gateway wakes it
+// once. One promise from the gateway, nothing asked of the recipient, so
+// there is no chain of acknowledgements to run out of.
+db.exec(`CREATE TABLE IF NOT EXISTS pending (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  relayRootId  TEXT NOT NULL,
+  toName       TEXT NOT NULL,
+  homeRoomId   TEXT NOT NULL,
+  homeThreadRootId TEXT,
+  homeThreadId TEXT NOT NULL,
+  sentAt       INTEGER NOT NULL,
+  deadline     INTEGER NOT NULL
+)`);
+const stmtPendingPut = db.prepare(
+  `INSERT INTO pending (relayRootId, toName, homeRoomId, homeThreadRootId, homeThreadId, sentAt, deadline)
+   VALUES (@relayRootId, @toName, @homeRoomId, @homeThreadRootId, @homeThreadId, @sentAt, @deadline)`,
+);
+const stmtPendingClear = db.prepare("DELETE FROM pending WHERE relayRootId = ? AND toName = ?");
+const stmtPendingDue = db.prepare("SELECT * FROM pending WHERE deadline <= ? ORDER BY deadline");
+
+type Pending = {
+  relayRootId: string;
+  toName: string;
+  homeRoomId: string;
+  homeThreadRootId: string | null;
+  homeThreadId: string;
+  sentAt: number;
+};
 
 type Bridge = {
   relayRootId: string;
@@ -324,7 +357,7 @@ function runClaudeStreaming(opts: {
   systemPrompt?: string;
   systemPromptMode?: SystemPromptMode;
   disallowedTools?: string[];
-  mcpConfig?: string;
+  mcpConfigs?: string[];
   timeoutMs?: number;
   callbacks?: StreamCallbacks;
 }): Promise<RunResult> {
@@ -348,7 +381,7 @@ function runClaudeStreaming(opts: {
       // matching no known tool only warns, so a typo silently grants what it meant
       // to withhold — check the log after changing this.
       ...(opts.disallowedTools?.length ? ["--disallowed-tools", ...opts.disallowedTools] : []),
-      ...(opts.mcpConfig ? ["--mcp-config", opts.mcpConfig] : []),
+      ...(opts.mcpConfigs?.length ? ["--mcp-config", ...opts.mcpConfigs] : []),
     ];
 
     const child = spawn(opts.claudeBin, args, {
@@ -760,6 +793,9 @@ type RoomConfig = {
    *  no connector tools and no error anywhere. Declaring the connector as a
    *  `claudeai-proxy` server pins it into the awaited path. */
   mcpConfig?: string;
+  /** Minutes before a sibling's silence wakes the sender of a `message` that
+   *  expects an answer. Default 5. */
+  replyTimeoutMinutes?: number;
   /** Start a thread on every top-level message here, so each exchange gets its
    *  own bounded session. Off by default, which leaves the room behaving exactly
    *  as it did: threads are then opt-in, and Terry starts one by hand when he
@@ -776,6 +812,7 @@ type RoomConfigFile = {
     systemPrompt?: string;
     systemPromptMode?: SystemPromptMode;
     workingDirectory?: string;
+    replyTimeoutMinutes?: number;
   };
   /** MXIDs treated as human in every room lacking its own `humans` list. */
   defaultHumans?: string[];
@@ -1224,6 +1261,149 @@ async function forwardRelayBlocks(
   }
 }
 
+// --- The `message` tool ---
+
+type TurnCtx = { roomId: string; threadId: string; agent: RoomConfig | null };
+
+/** Live turns, by the token their MCP server presents. A token is valid only
+ *  while its turn's CLI is running. */
+const turnTokens = new Map<string, TurnCtx>();
+let siblingsUrl = "";
+const SIBLINGS_SERVER = path.join(import.meta.dirname, "mcp-siblings.mjs");
+const DEFAULT_REPLY_TIMEOUT_MIN = 5;
+
+function replyTimeoutMs(agent: RoomConfig | null): number {
+  return (agent?.replyTimeoutMinutes ?? roomConfig.defaults?.replyTimeoutMinutes ?? DEFAULT_REPLY_TIMEOUT_MIN) * 60_000;
+}
+
+function clock(ms: number): string {
+  return new Date(ms).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+/** Post `text` to sibling `to`, from the conversation `ctx`, and say what the
+ *  sender can rely on. From a private room it goes into the shared room, in the
+ *  thread this conversation already has there if any. From the shared room
+ *  itself it goes into the thread the turn is running in. */
+async function sendToSibling(ctx: TurnCtx, to: string, text: string, expectReply: boolean): Promise<string> {
+  to = to.trim().replace(/^@/, "").toLowerCase();
+  if (!/^[a-z][a-z0-9_-]{0,31}$/.test(to)) throw new Error(`"${to}" is not an agent name`);
+  if (to === selfName) throw new Error("that is you");
+  if (!text.trim()) throw new Error("nothing to send");
+
+  const relayRoomId = ctx.agent?.relayRoom;
+  const inShared = !relayRoomId || relayRoomId === ctx.roomId;
+  const sharedRoomId = inShared ? ctx.roomId : relayRoomId!;
+  if (inShared && !(ctx.agent?.allowBots ?? false)) throw new Error("this room has no shared room to send from");
+
+  const mxid = transport.mxidFor(to);
+  if (!(await transport.isJoined(sharedRoomId, mxid))) throw new Error(`${to} is not in the shared room`);
+
+  const threadRoot = ctx.threadId.startsWith("thread:") ? ctx.threadId.slice(7) : undefined;
+  const posted = `→ **${to}**\n\n${text}`;
+  const opts = { mentions: [mxid] };
+
+  let relayRootId: string;
+  if (inShared) {
+    const m = await transport.room(sharedRoomId, threadRoot).send(posted, opts);
+    relayRootId = threadRoot ?? m.id;
+  } else {
+    // One conversation here is one thread there, as for tagged blocks.
+    const existing = stmtBridgeByHome.get(ctx.threadId) as Bridge | undefined;
+    if (existing) {
+      await transport.room(sharedRoomId, existing.relayRootId).send(posted, opts);
+      relayRootId = existing.relayRootId;
+    } else {
+      const root = await transport.room(sharedRoomId).send(posted, opts);
+      relayRootId = root.id;
+      stmtBridgePut.run({
+        relayRootId, homeRoomId: ctx.roomId, homeThreadRootId: threadRoot ?? null,
+        homeThreadId: ctx.threadId, addressee: to, hops: 0, createdAt: Date.now(),
+      });
+    }
+  }
+  console.log(`[matrix-cc-bot] message to ${to} → ${sharedRoomId} thread ${relayRootId.slice(0, 8)}… (from ${ctx.threadId}, reply ${expectReply ? "expected" : "not expected"})`);
+
+  if (!expectReply) return `Posted to ${to}. No reply expected; nothing will wake you about it.`;
+  const now = Date.now();
+  const deadline = now + replyTimeoutMs(ctx.agent);
+  stmtPendingPut.run({
+    relayRootId, toName: to, homeRoomId: ctx.roomId, homeThreadRootId: threadRoot ?? null,
+    homeThreadId: ctx.threadId, sentAt: now, deadline,
+  });
+  return `Posted to ${to}. Your turn can end now: you will be woken by their answer, or once at ${clock(deadline)} if none comes.`;
+}
+
+function startSiblingsEndpoint(): Promise<void> {
+  const server = http.createServer((req, res) => {
+    const reply = (code: number, body: object) => {
+      res.writeHead(code, { "content-type": "application/json" });
+      res.end(JSON.stringify(body));
+    };
+    if (req.method !== "POST" || req.url !== "/message") return reply(404, { error: "not found" });
+    let raw = "";
+    req.on("data", (c) => { raw += c; if (raw.length > 1_000_000) req.destroy(); });
+    req.on("end", async () => {
+      try {
+        const { token, to, text, expect_reply } = JSON.parse(raw);
+        const ctx = turnTokens.get(token);
+        if (!ctx) return reply(403, { error: "Not sent: this turn is no longer running." });
+        reply(200, { result: await sendToSibling(ctx, String(to ?? ""), String(text ?? ""), expect_reply !== false) });
+      } catch (err) {
+        reply(200, { error: `Not sent: ${(err as Error).message}` });
+      }
+    });
+  });
+  return new Promise((resolve) => server.listen(0, "127.0.0.1", () => {
+    siblingsUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    resolve();
+  }));
+}
+
+/** The per-turn `--mcp-config` that gives a turn the `message` tool. */
+function siblingsMcpConfig(token: string): string {
+  return JSON.stringify({ mcpServers: { siblings: {
+    command: process.execPath,
+    args: [SIBLINGS_SERVER],
+    env: { SIBLINGS_URL: siblingsUrl, SIBLINGS_TOKEN: token },
+  } } });
+}
+
+/** Wake each sender whose sibling has not answered in time. Once each: the
+ *  rows are deleted before the turn runs, whatever the turn then does. */
+async function firePendingDeadlines(): Promise<void> {
+  const due = stmtPendingDue.all(Date.now()) as Pending[];
+  const seen = new Set<string>();
+  for (const p of due) {
+    stmtPendingClear.run(p.relayRootId, p.toName);
+    const key = `${p.homeThreadId}\0${p.toName}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const agent = getRoomAgent(p.homeRoomId);
+    const cwd = agent?.workingDirectory ?? roomConfig.defaults?.workingDirectory ?? DEFAULT_CWD;
+    const entry = getOrCreate(threadMap, p.homeThreadId, cwd);
+    if (agent) { entry.cwd = cwd; entry.model = agent.model ?? roomConfig.defaults?.model ?? "opus"; }
+    const room = transport.room(p.homeRoomId, p.homeThreadRootId ?? undefined);
+    const mins = Math.round((Date.now() - p.sentAt) / 60_000);
+    console.log(`[matrix-cc-bot] ${p.toName} did not answer ${p.homeThreadId} in ${mins} min — waking it`);
+
+    if (entry.awaitingAnswer) {
+      await room.send(`*${p.toName} has not answered (${mins} min). Not waking this conversation while it waits on a confirmation.*`, { notice: true }).catch(() => {});
+      continue;
+    }
+    const release = await acquireTurn(entry.sessionId);
+    if (!release) continue;
+    try {
+      await runTurn({
+        room, roomId: p.homeRoomId, threadId: p.homeThreadId, entry, agent,
+        prompt: `[gateway] ${p.toName} has not answered your message from ${clock(p.sentAt)} (${mins} min). This is the only reminder.`,
+      });
+    } finally {
+      release();
+    }
+  }
+}
+
 // --- One turn ---
 
 /** Runs Claude for one turn and delivers the result. Shared by messages and cron. */
@@ -1257,6 +1437,15 @@ async function runTurn(opts: {
   // reach the sibling a minute late. Chained to keep the blocks in order.
   let relayed: Promise<void> = Promise.resolve();
 
+  // The `message` tool, wherever this conversation can reach a sibling.
+  const turnToken = crypto.randomUUID();
+  const canMessage = !!siblingsUrl && (!!agent?.relayRoom || (agent?.allowBots ?? false));
+  if (canMessage) turnTokens.set(turnToken, { roomId, threadId, agent });
+  const mcpConfigs = [
+    ...(agent?.mcpConfig ? [agent.mcpConfig] : []),
+    ...(canMessage ? [siblingsMcpConfig(turnToken)] : []),
+  ];
+
   const runOpts = {
     sessionId: entry.sessionId,
     prompt,
@@ -1266,7 +1455,7 @@ async function runTurn(opts: {
     systemPrompt,
     systemPromptMode: resolveSystemPromptMode(agent),
     disallowedTools: agent?.disallowedTools,
-    mcpConfig: agent?.mcpConfig,
+    mcpConfigs,
     callbacks: {
       onText: (fullText: string) => handleStreamText(previewState, fullText),
       onSegment: (text: string) => {
@@ -1336,6 +1525,7 @@ async function runTurn(opts: {
     if (previewState.msg) await previewState.msg.edit(`Error: ${(err as Error).message}`).catch(() => {});
     else await room.send(`Error: ${(err as Error).message}`, { notice: true }).catch(() => {});
   } finally {
+    turnTokens.delete(turnToken);
     await relayed;
     await transport.setTyping(roomId, false);
     for (const p of opts.filePaths ?? []) fs.unlink(p, () => {});
@@ -1383,6 +1573,9 @@ transport.onMessage(async (msg) => {
     } else {
       return;
     }
+
+    // An answer from somebody this conversation is waiting on settles the wait.
+    if (fromBot && msg.threadRootId) stmtPendingClear.run(msg.threadRootId, localpart(msg.sender));
 
     // Where a notice or a command answer belongs: exactly where it was typed.
     // A command must never *start* a thread — `!new` at the top level is about
@@ -1504,7 +1697,8 @@ transport.onMessage(async (msg) => {
     // lands in admits no bots, because it is exactly there that the label is
     // load-bearing: it is the only thing separating a sibling's words from
     // Terry's in the room where his word is authority.
-    const body = (routed || (agent?.allowBots ?? false)) ? `[${msg.senderName}] ${content}` : content;
+    const label = fromBot ? `${msg.senderName} — an agent, not a human` : msg.senderName;
+    const body = (routed || (agent?.allowBots ?? false)) ? `[${label}] ${content}` : content;
     let userMessage = body;
     if (filePaths.length === 1) {
       userMessage = `${body}\n\nThe user attached a file: ${filePaths[0]}`.trim();
@@ -1562,6 +1756,9 @@ process.on("SIGTERM", shutdown);
   );
 
   applyRoomHumans();
+  await startSiblingsEndpoint();
+  setInterval(() => { firePendingDeadlines().catch((err) => console.error("[matrix-cc-bot] deadline check failed:", (err as Error).message)); }, 30_000);
+  console.log(`[matrix-cc-bot] message tool on ${siblingsUrl}; reply timeout ${roomConfig.defaults?.replyTimeoutMinutes ?? DEFAULT_REPLY_TIMEOUT_MIN} min by default`);
   const configured = Object.entries(roomConfig.rooms);
   console.log(
     configured.length

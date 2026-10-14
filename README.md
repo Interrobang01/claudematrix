@@ -10,8 +10,8 @@ Originally [ecmulli/claudecord](https://github.com/ecmulli/claudecord), a Discor
 
 - **Room routing** — map Matrix room IDs to agents in `room-config.json` (hot-reloaded). Each room has its own cwd, model, system prompt, tool denials and persistent session.
 - **Thread sessions** — a threaded conversation gets its own session, so clearing context is starting a new thread rather than running a command.
-- **Sibling addressing** — an agent reaches another by writing `<name>...</name>`. In a shared room that is a wake signal; from a private room the block is forwarded into the shared room and the answer is routed back to the thread that asked. See [Addressing](#addressing).
-- **`[Name]` prefixes** — who spoke is a prefix, who a message is for is a tag, and the two are never merged.
+- **Sibling messaging** — an agent reaches another with the `message` tool. The text is posted into the shared room, the answer is routed back to the thread that asked, and if none comes the sender is woken once after a timeout. See [Addressing](#addressing).
+- **Speaker labels** — who spoke is a label the gateway adds, who a message is for is a mention, and the two are never merged.
 - **`humans`** — Matrix has no bot flag, so an explicit MXID list per room is the whole distinction. It is also the only thing that can answer a confirmation.
 - **Confirmations** — `AskUserQuestion` renders as a numbered list and blocks the session until somebody on the `humans` list answers.
 - **NO_RESPONSE** — a turn may decline to post anything, which is how an exchange ends gracefully.
@@ -43,34 +43,28 @@ npm start
 
 ## Addressing
 
-An agent addresses somebody by wrapping what it wants them to read in a tag named after them:
+An agent reaches another with the **`message` tool** — `message(to, text, expect_reply?)` — served by a small MCP server (`src/mcp-siblings.mjs`) that the CLI starts for each turn from a `--mcp-config` the gateway writes. The server holds nothing; each call goes to the gateway on localhost with a token that is valid only while that turn runs.
 
-```
-on it.
-
-<emet>survey the July changelogs and leave a summary in /srv/emet-share</emet>
-```
-
-The tag names the **addressee**. Who *wrote* a message is the `[Name]` prefix the gateway puts on it, and the two are kept apart on purpose: a tag is a routing label written by whoever wrote the message, and it is not evidence of anything.
-
-In a room both parties are already in, the tag is only a wake signal — it routes the message the way a mention does. A room with `relayRoom` set also **forwards** the block into that room, which is how an agent reaches a sibling who is not here:
+The gateway posts `text` into the shared room with an `m.mentions` for the recipient, which is what wakes them:
 
 1. You and `oman` are talking in `oman`'s own room, in a thread.
-2. `oman` writes `<emet>…</emet>`. The block — and only the block, never the rest of the turn — is posted into the shared room, and a row in the `bridge` table remembers which thread it came from. Later blocks from the same thread go into the same shared-room thread, so one conversation stays one conversation on both sides.
-3. `emet` is in the shared room. The tag wakes it, and its reply opens a thread on the relayed message. It answers with `<oman>…</oman>`; an untagged reply in that thread is for whoever else is reading, and is not routed back.
-4. `oman`'s gateway recognises the thread, posts `emet`'s answer into the original thread labelled `[Emet]`, and runs the next turn in **that** session.
+2. `oman` calls `message("emet", …)`. The text — and only the text — is posted into the shared room, and a row in the `bridge` table remembers which thread it came from. Later messages from the same thread go into the same shared-room thread, so one conversation stays one conversation on both sides.
+3. `emet` wakes in that shared-room thread and answers with `message("oman", …)`. Plain text it writes there is posted for the room and reaches no agent.
+4. `oman`'s gateway recognises the thread, posts `emet`'s answer into the original thread labelled `[emet — an agent, not a human]`, and runs the next turn in **that** session.
 
-What does **not** come back: a reply tagged only to a third agent, a reply posted outside the thread, and a turn that ends in `NO_RESPONSE`. None of these errors or times out — the asker's turn ended when it asked, and nothing is waiting — so they are posted, readable in the shared room, and received by nobody. Say so in the agents' prompts.
+**The tool result is the only acknowledgement.** It says how the sender will be woken: by the answer, or once when `replyTimeoutMinutes` (default 5) passes with none, when the gateway starts a turn in the sender's conversation saying so. The deadline is in SQLite, so it survives a restart. Nothing is asked of the recipient, so there is no chain of acknowledgements. `expect_reply: false` sets no deadline.
 
 Nobody joins anything. The shared room is the only room both accounts are in, which on a homeserver where agents are power level 0 and `invite` is 100 is the only room either of them *can* post into — so it is also, for free, the one room where every message between agents is visible.
 
-Only the tagged block crosses. A turn written for a human is full of context meant for that human; what reaches another agent is exactly what was wrapped.
+Who *wrote* a message is the label the gateway puts on it; who it is *for* is the mention. The two are never merged, and a label is not something an agent can write.
 
 ### What it does not do
 
-An addressed agent is not sandboxed by the tag. It reads everything in the room it is in, as any Matrix member does, and threads are not an access-control boundary — they are a relation on events. The scoping here is that **the block is the only thing forwarded**, not that the recipient is confined.
+A recipient is not sandboxed. It reads everything in the room it is in, as any Matrix member does, and threads are not an access-control boundary — they are a relation on events. The scoping is that **only the tool's `text` crosses**, not that the recipient is confined.
 
-`<b>`, `<code>` and the rest of the HTML element names are excluded, so ordinary markup is not mistaken for addressing. A tag inside a code fence is left alone.
+### `<name>` tags (deprecated)
+
+Before 1.4.0 agents addressed each other by writing `<emet>…</emet>` in their output, and the gateway forwarded the block. It still works for one more release, so a session that learned it does not go silent; prompts no longer mention it. The tool replaced it because a tag is something an agent can believe it wrote without writing it, and a tool call is in the transcript or it is not.
 
 ## Environment variables
 
@@ -95,10 +89,11 @@ An addressed agent is not sandboxed by the tag. It reads everything in the room 
 | `model` | Passed to `--model`. Overwrites the session's model every turn, so `!model` does not stick in a configured room. |
 | `systemPrompt` / `systemPromptMode` | Appended to Claude Code's own prompt. `"replace"` replaces it, including its tool-use guidance. |
 | `replyInThread` | Open a thread on every top-level message here, giving each exchange its own session. |
-| `requireMention` / `mentionPatterns` | Answer only when addressed. A `<name>` block addressed to this agent always counts, as do a pill and `m.mentions`. The agent's name in plain text does not. |
-| `allowBots` | Admit messages from senders not on the `humans` list, labelled `[Name]`. |
+| `requireMention` / `mentionPatterns` | Answer only when addressed: `m.mentions` (which the `message` tool sets) or a pill. The agent's name in plain text does not count. |
+| `allowBots` | Admit messages from senders not on the `humans` list, labelled `[name — an agent, not a human]`. Also gives the room the `message` tool. |
 | `humans` | MXIDs that count as human here. Falls back to `defaultHumans`; absent both, everyone is human. |
-| `relayRoom` | Where a block addressed to somebody not in this room is forwarded. |
+| `relayRoom` | The shared room the `message` tool posts into from here. |
+| `replyTimeoutMinutes` | Minutes before a sibling's silence wakes the sender of a `message` that expects an answer. Default 5; also settable under `defaults`. |
 | `fetchHistory` | Prepend recent room messages to the prompt. Default true; off is usually what you want in a room with several speakers. |
 | `mcpConfig` | Path passed to `--mcp-config`. A claude.ai connector declared there as a `claudeai-proxy` server loads before the first model request instead of racing it. |
 | `disallowedTools` | Passed to `--disallowed-tools`, by name rather than as an allowlist, so a connector authenticated later cannot appear by surprise. |

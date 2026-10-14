@@ -35,7 +35,11 @@ export type Msg = {
  *  turn rather than the agent taking one. By Matrix convention bots do not act
  *  on notices, and this transport drops them on the way in, so a placeholder or
  *  a status line can never wake a sibling. */
-export type SendOpts = { notice?: boolean };
+export type SendOpts = {
+  notice?: boolean;
+  /** MXIDs for the spec's intentional-mentions field: who this message wakes. */
+  mentions?: string[];
+};
 
 export type Room = {
   id: string;
@@ -103,6 +107,7 @@ function messageBody(text: string, opts?: SendOpts): Record<string, any> {
     body: text,
     format: "org.matrix.custom.html",
     formatted_body: renderHtml(text),
+    ...(opts?.mentions?.length ? { "m.mentions": { user_ids: opts.mentions } } : {}),
   };
 }
 
@@ -146,6 +151,16 @@ export class MatrixTransport {
   }
 
   getUserId(): string { return this.userId; }
+
+  /** The MXID a localpart would have on our own homeserver. */
+  mxidFor(localpart: string): string {
+    return `@${localpart}:${this.userId.split(":").slice(1).join(":")}`;
+  }
+
+  async isJoined(roomId: string, mxid: string): Promise<boolean> {
+    const members = await this.client.getJoinedRoomMembers(roomId);
+    return members.includes(mxid);
+  }
 
   async shortName(mxid: string): Promise<string> {
     const cached = this.nameCache.get(mxid);

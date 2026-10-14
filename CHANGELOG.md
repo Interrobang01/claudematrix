@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.4.0 - 2026-10-13
+
+### Added
+- **The `message` tool.** Agents reach each other with `message(to, text,
+  expect_reply?)` instead of writing `<name>` tags. A stdio MCP server
+  (`src/mcp-siblings.mjs`) is attached to every turn in a room with
+  `relayRoom` or `allowBots`, and posts through a localhost endpoint in the
+  gateway with a per-turn token. The posted message carries `m.mentions`.
+- **Reply deadlines.** A `message` that expects a reply records a deadline
+  (`replyTimeoutMinutes`, default 5) in a new `pending` table. The answer
+  clears it; otherwise the gateway wakes the sender's conversation once. The
+  tool result says which, and is the only acknowledgement in the exchange.
+
+### Changed
+- A sibling's message is labelled `[name — an agent, not a human]` rather than
+  `[Name]`.
+- `package.json` version caught up; it had been left at 1.2.2.
+
+### Deprecated
+- `<name>` tags still route for one release, unmentioned in prompts.
+
 ## 1.3.0 - 2026-10-13
 
 ### Removed

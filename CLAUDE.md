@@ -15,8 +15,10 @@ own storage, not here.
 - **Transport:** `src/matrix.ts` — presents a `Room` you can `send()` to and a
   `Msg` you can `edit()`/`reply()`/`delete()`. The policy code above it never
   touches Matrix.
-- **Addressing:** `src/relay.ts` — the `<name>...</name>` block, its parsing and
-  its rendering.
+- **Sibling messaging:** the `message` tool. `src/mcp-siblings.mjs` is a stdio MCP
+  server the CLI starts per turn; it POSTs to the gateway's localhost endpoint,
+  which posts into the shared room and keeps the reply deadline.
+  `src/relay.ts` is the deprecated `<name>` tag, kept one release.
 - **Origin:** a fork of [ecmulli/claudecord](https://github.com/ecmulli/claudecord),
   which is itself fredchu/discord-claude-code-bot plus channel routing. The
   Discord vocabulary in old config files comes from there.
@@ -25,8 +27,8 @@ own storage, not here.
 
 ```
 room message → gating → session key → claude -p --resume <uuid> → message posted
-                                   ↘ <name> block → shared room → bridge row
-                    bridged reply ← ↙
+                                   ↘ message tool → shared room → bridge row (+ deadline)
+                    bridged reply ← ↙        deadline passes → one wake turn
 ```
 
 ## Things to know before changing anything
@@ -42,23 +44,29 @@ room message → gating → session key → claude -p --resume <uuid> → messag
 - **Deny rules survive `bypassPermissions`; allow rules do not.**
 - **`--session-id` must be a UUID**, and the CLI only says so when a turn runs.
   Startup warns instead.
-- **A tag is not evidence.** `<name>` says who a message is *for* and is written
-  by whoever wrote the message. `[Name]` says who *wrote* it and is put on by
-  the gateway. Never merge them, and never let a tag decide trust.
+- **Addressing is not evidence.** The mention says who a message is *for* and is
+  chosen by whoever wrote it. The `[name — an agent, not a human]` label says
+  who *wrote* it and is put on by the gateway. Never merge them.
+- **The `message` tool's result is the only acknowledgement.** It promises a
+  wake: the answer, or one gateway turn at the deadline. The deadline lives in
+  SQLite so a restart keeps it. Do not add acknowledgements from the recipient;
+  that is how you end up needing infinitely many.
+- **`mcp-siblings.mjs` is plain JS.** The CLI starts it with the agent's
+  workspace as cwd, where tsx does not resolve, and Node 22 does not strip types.
 - **`humans` is the trust boundary**, not the room. A confirmation blocks its
   session until somebody on that list answers.
 - **A thread is not an access-control boundary.** It is a relation on events;
-  anyone in the room reads all of it. Scoping here comes from forwarding only
-  the tagged block, never from confining a recipient.
+  anyone in the room reads all of it. Scoping here comes from sending only the
+  tool's text, never from confining a recipient.
 - **The posted message is every text block, not `result`.** stream-json's
   `result` is only the last block, so posting it drops whatever the model said
   before its last tool call. `NO_RESPONSE` is judged on the last block alone.
 - **Anything the gateway says about a turn is `m.notice`.** The transport drops
   notices on the way in, so a placeholder or status line can never be read
   as a turn by a sibling sharing the room.
-- **Only a tagged message is routed home from a bridged thread.** A bridge row
-  lives as long as its thread, so "untagged from the addressee counts" (1.1.0)
-  also caught the addressee answering Terry there. Removed in 1.1.2.
+- **Only an addressed message is routed home from a bridged thread.** A bridge
+  row lives as long as its thread, so "anything from the addressee counts"
+  (1.1.0) also caught the addressee answering Terry there. Removed in 1.1.2.
 - **Verify behaviour, not the config value.** This codebase has a history of
   keys that were read by nothing (`replyInThread` sat inert in the config for
   months) and of configs that silently failed to load. New config keys need a
@@ -69,10 +77,11 @@ room message → gating → session key → claude -p --resume <uuid> → messag
 ```
 src/index.ts              routing, sessions, relay, commands, cron
 src/matrix.ts             transport
-src/relay.ts              <name> parsing and rendering
+src/mcp-siblings.mjs      the message tool (stdio MCP, per turn)
+src/relay.ts              <name> parsing and rendering (deprecated)
 room-config.json          per-room agents (gitignored, hot-reloaded)
 .env                      homeserver URL, access token, DEFAULT_CWD, CLAUDE_BIN
-threads.db                SQLite (WAL): sessions, and the relay bridge
+threads.db                SQLite (WAL): sessions, the relay bridge, reply deadlines
 matrix-sync.json          /sync token (gitignored)
 ```
 
