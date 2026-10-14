@@ -277,6 +277,8 @@ const running = new Map<string, ChildProcess>();
 
 type StreamCallbacks = {
   onText?: (fullText: string) => void;
+  /** One completed text block, as soon as the CLI emits it. */
+  onSegment?: (text: string) => void;
   onToolUse?: (toolName: string) => void;
 };
 
@@ -400,6 +402,7 @@ function runClaudeStreaming(opts: {
               if (!seenSegments.has(key)) {
                 seenSegments.add(key);
                 segments.push(messageText);
+                opts.callbacks?.onSegment?.(messageText);
               }
             }
             if (messageText && messageText !== lastSeenText) {
@@ -1294,6 +1297,12 @@ async function runTurn(opts: {
     ? `Room context:\n${roomContext}\n\n${baseSystemPrompt}`
     : baseSystemPrompt;
 
+  // `<name>` blocks are forwarded as each text block completes, not when the
+  // process exits. A turn that starts a background task keeps the CLI alive
+  // until the task finishes, so a ping written before a `sleep 60` used to
+  // reach the sibling a minute late. Chained to keep the blocks in order.
+  let relayed: Promise<void> = Promise.resolve();
+
   const runOpts = {
     sessionId: entry.sessionId,
     prompt,
@@ -1307,6 +1316,9 @@ async function runTurn(opts: {
     mcpConfig: agent?.mcpConfig,
     callbacks: {
       onText: (fullText: string) => handleStreamText(previewState, fullText),
+      onSegment: (text: string) => {
+        relayed = relayed.then(() => forwardRelayBlocks(text, { roomId, threadId, agent }));
+      },
       onToolUse: createToolUseHandler(previewState),
     },
   };
@@ -1367,12 +1379,12 @@ async function runTurn(opts: {
     entry.lastBotMessageId = botReply.id;
     saveEntry(threadId, entry);
 
-    await forwardRelayBlocks(result.text, { roomId, threadId, agent });
   } catch (err) {
     if (previewState.timer) clearTimeout(previewState.timer);
     if (previewState.msg) await previewState.msg.edit(`Error: ${(err as Error).message}`).catch(() => {});
     else await room.send(`Error: ${(err as Error).message}`, { notice: true }).catch(() => {});
   } finally {
+    await relayed;
     await transport.setTyping(roomId, false);
     for (const p of opts.filePaths ?? []) fs.unlink(p, () => {});
   }

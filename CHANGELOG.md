@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.1 - 2026-10-13
+
+### Fixed
+- **A `<name>` block reached the sibling only when the whole turn ended.**
+  Blocks were forwarded after the CLI exited, and a turn that starts a
+  background task keeps the CLI alive until the task finishes: a ping written
+  before a backgrounded `sleep 60` arrived a minute late. Each block is now
+  forwarded as soon as its text block completes. A consequence: a block in a
+  turn that ends in `NO_RESPONSE` or an `AskUserQuestion` is forwarded too,
+  where it used to be dropped with the rest of the turn.
+
 ## 1.2.0 - 2026-10-13
 
 ### Changed
