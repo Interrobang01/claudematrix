@@ -938,8 +938,10 @@ for (const f of CONFIG_PATHS) fs.watchFile(f, { interval: 5000 }, () => {
   roomConfig = loadRoomConfig();
   preloadContextFiles();
   warnOnBadSessionIds();
-  // Schedules are armed from the config, so a changed one needs re-arming;
-  // before this, editing a schedule silently did nothing until a restart.
+  // Everything `!reload-config` does. The `humans` lists and the schedules are
+  // pushed into the transport and the cron at load time, so before this an
+  // edit to either silently did nothing until a restart.
+  applyRoomHumans();
   startScheduledJobs();
 });
 

@@ -14,8 +14,9 @@
   `schedule_runs` table and advance only on success.
 
 ### Fixed
-- **Editing a schedule did nothing until a restart.** The config hot-reload
-  never re-armed cron jobs; it does now.
+- **Editing a schedule or a `humans` list did nothing until a restart.** The
+  config hot-reload re-read the file but neither re-armed cron jobs nor pushed
+  `humans` into the transport; it now does everything `!reload-config` does.
 
 ## 1.4.0 - 2026-10-13
 
