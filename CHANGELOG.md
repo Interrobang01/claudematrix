@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.0 - 2026-10-13
+
+### Removed
+- **Spend ceilings.** `maxCostUsdPerTurn`, `maxCostUsdPerDay` and the in-memory
+  ledger are gone. The subscription's own usage window already bounds what a
+  turn or a loop can cost, and the daily cap was reset by every restart anyway.
+  Old configs still load; the keys are ignored.
+
 ## 1.2.2 - 2026-10-13
 
 ### Added

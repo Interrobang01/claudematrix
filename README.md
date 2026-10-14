@@ -8,14 +8,13 @@ Originally [ecmulli/claudecord](https://github.com/ecmulli/claudecord), a Discor
 
 ## Features
 
-- **Room routing** — map Matrix room IDs to agents in `room-config.json` (hot-reloaded). Each room has its own cwd, model, system prompt, tool denials, spend ceiling and persistent session.
+- **Room routing** — map Matrix room IDs to agents in `room-config.json` (hot-reloaded). Each room has its own cwd, model, system prompt, tool denials and persistent session.
 - **Thread sessions** — a threaded conversation gets its own session, so clearing context is starting a new thread rather than running a command.
 - **Sibling addressing** — an agent reaches another by writing `<name>...</name>`. In a shared room that is a wake signal; from a private room the block is forwarded into the shared room and the answer is routed back to the thread that asked. See [Addressing](#addressing).
 - **`[Name]` prefixes** — who spoke is a prefix, who a message is for is a tag, and the two are never merged.
 - **`humans`** — Matrix has no bot flag, so an explicit MXID list per room is the whole distinction. It is also the only thing that can answer a confirmation.
 - **Confirmations** — `AskUserQuestion` renders as a numbered list and blocks the session until somebody on the `humans` list answers.
 - **NO_RESPONSE** — a turn may decline to post anything, which is how an exchange ends gracefully.
-- **Spend ceilings** — per-turn (`--max-budget-usd`) and per-day dollar caps, charged to the room the conversation lives in.
 - **Attachments** — `mxc://` media downloaded and handed to Claude Code as files.
 - **Scheduled jobs** — cron agents that post into a room on a schedule.
 - **SQLite storage** — WAL, crash-safe session and bridge persistence.
@@ -103,7 +102,6 @@ An addressed agent is not sandboxed by the tag. It reads everything in the room 
 | `fetchHistory` | Prepend recent room messages to the prompt. Default true; off is usually what you want in a room with several speakers. |
 | `mcpConfig` | Path passed to `--mcp-config`. A claude.ai connector declared there as a `claudeai-proxy` server loads before the first model request instead of racing it. |
 | `disallowedTools` | Passed to `--disallowed-tools`, by name rather than as an allowlist, so a connector authenticated later cannot appear by surprise. |
-| `maxCostUsdPerTurn` / `maxCostUsdPerDay` | Per-turn `--max-budget-usd`; per-day total in memory, so a restart forgives the day. |
 | `sessionGroup` | Rooms sharing a group share one session. A thread overrides it. |
 | `schedule` | `{ cron, timezone, prompt }` for a scheduled turn. |
 | `contextFile` | A file prepended to the system prompt, hot-reloaded with the config. |

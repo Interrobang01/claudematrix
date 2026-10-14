@@ -323,7 +323,6 @@ function runClaudeStreaming(opts: {
   resume: boolean;
   systemPrompt?: string;
   systemPromptMode?: SystemPromptMode;
-  maxBudgetUsd?: number;
   disallowedTools?: string[];
   mcpConfig?: string;
   timeoutMs?: number;
@@ -344,7 +343,6 @@ function runClaudeStreaming(opts: {
       ...(opts.systemPrompt
         ? [opts.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", opts.systemPrompt]
         : []),
-      ...(opts.maxBudgetUsd ? ["--max-budget-usd", String(opts.maxBudgetUsd)] : []),
       // Variadic: every bare word after it is taken as another rule. Safe here
       // because the prompt is passed with -p up front, never positionally. A rule
       // matching no known tool only warns, so a typo silently grants what it meant
@@ -462,7 +460,7 @@ function runClaudeStreaming(opts: {
       clearTimeout(timer);
       running.delete(opts.sessionId);
       const errHint = stderrBuf.trim() ? `\n\n⚠️ stderr: ${stderrBuf.trim().slice(0, 500)}` : "";
-      // An error result (budget, a forgotten session) is not one of the text
+      // An error result (a forgotten session, say) is not one of the text
       // blocks, and is the part worth seeing.
       if (isError && resultText && !segments.includes(resultText)) segments.push(resultText);
       const text = joinSegments(segments) || resultText || `(no output)${errHint}`;
@@ -769,10 +767,6 @@ type RoomConfig = {
    *  either way — that does not need enabling, because it cannot happen by
    *  accident. */
   replyInThread?: boolean;
-  /** Passed to the CLI as --max-budget-usd, which aborts a turn mid-flight. */
-  maxCostUsdPerTurn?: number;
-  /** Refuse new turns in this room once the day's spend reaches this. */
-  maxCostUsdPerDay?: number;
 };
 
 type RoomConfigFile = {
@@ -787,8 +781,8 @@ type RoomConfigFile = {
   defaultHumans?: string[];
   /** Ignore mentions in rooms that have no entry above. Default false, which is
    *  upstream's behaviour: a mention anywhere the bot can see starts a turn with
-   *  DEFAULT_CWD, the generic prompt, and none of a room's tool denials or spend
-   *  ceiling. Where the room list is a containment boundary, set this true. */
+   *  DEFAULT_CWD, the generic prompt, and none of a room's tool
+   *  denials. Where the room list is a containment boundary, set this true. */
   configuredRoomsOnly?: boolean;
 };
 
@@ -950,10 +944,9 @@ function matchesMentionPatterns(content: string, agent: RoomConfig | null): bool
 // room whose other conversations were fine. A loop you can see beats a brake
 // that fires on the wrong thing.
 //
-// What remains: `maxCostUsdPerDay`, the backstop that actually matters because
-// a loop is a bill before it is anything else; NO_RESPONSE, the graceful end an
-// agent can choose; and `bridge.hops`, counted and logged so a loop is visible
-// in the log and in the database while it is still happening.
+// What remains: NO_RESPONSE, the graceful end an agent can choose; `bridge.hops`,
+// counted and logged so a loop is visible while it is still happening; and the
+// subscription's own usage window, which bounds what any loop can cost.
 const HOPS_NOISY = 12;
 
 // --- Turn serialization ---
@@ -1001,40 +994,6 @@ function acquireTurn(key: string): Promise<(() => void) | null> {
   return new Promise((resolve) => {
     held.waiting.push(() => resolve(makeRelease()));
   });
-}
-
-// --- Spend ledger ---
-
-// An agent talked into a loop is a financial problem before it is anything else,
-// so the ceiling is enforced here rather than left to the model to observe.
-// In memory only: a restart forgives the day's spend.
-type Spend = { day: string; usd: number; notified: boolean };
-const spendByRoom = new Map<string, Spend>();
-
-function utcDay(): string {
-  return new Date().toISOString().slice(0, 10);
-}
-
-function recordSpend(roomId: string, usd: number | undefined): void {
-  if (!usd) return;
-  const day = utcDay();
-  const rec = spendByRoom.get(roomId);
-  if (!rec || rec.day !== day) {
-    spendByRoom.set(roomId, { day, usd, notified: false });
-  } else {
-    rec.usd += usd;
-  }
-}
-
-/** True when the room is out of budget for today; notifies once per day. */
-function overDailyBudget(roomId: string, agent: RoomConfig | null): { over: boolean; announce: boolean; spent: number; cap: number } {
-  const cap = agent?.maxCostUsdPerDay ?? 0;
-  const rec = spendByRoom.get(roomId);
-  const spent = rec && rec.day === utcDay() ? rec.usd : 0;
-  if (!cap || spent < cap) return { over: false, announce: false, spent, cap };
-  const announce = !!rec && !rec.notified;
-  if (rec) rec.notified = true;
-  return { over: true, announce, spent, cap };
 }
 
 // --- Silent turns ---
@@ -1193,11 +1152,6 @@ function startScheduledJobs(): void {
         return;
       }
       try {
-        const budget = overDailyBudget(roomId, cfg);
-        if (budget.over) {
-          console.log(`[matrix-cc-bot] cron: ${cfg.name} over daily budget, skipping`);
-          return;
-        }
         await runTurn({
           room, roomId, threadId, entry, agent: cfg,
           prompt, replyTo: undefined,
@@ -1311,7 +1265,6 @@ async function runTurn(opts: {
     claudeBin: CLAUDE_BIN,
     systemPrompt,
     systemPromptMode: resolveSystemPromptMode(agent),
-    maxBudgetUsd: agent?.maxCostUsdPerTurn,
     disallowedTools: agent?.disallowedTools,
     mcpConfig: agent?.mcpConfig,
     callbacks: {
@@ -1335,7 +1288,6 @@ async function runTurn(opts: {
       result = await runClaudeStreaming({ ...runOpts, sessionId: entry.sessionId, resume: false });
     }
 
-    recordSpend(roomId, result.costUsd);
     if (previewState.timer) clearTimeout(previewState.timer);
 
     const askDenial = result.permissionDenials?.find((d) => d.tool_name === "AskUserQuestion");
@@ -1347,7 +1299,7 @@ async function runTurn(opts: {
     }
 
     // The model declined to speak. In a room where agents hear each other,
-    // silence is what ends an exchange gracefully; the budget is the other way.
+    // silence is what ends an exchange gracefully.
     // Judged on the last block: a turn that says "let me check", looks, and then
     // decides there is nothing to add has decided, and the narration goes too.
     // The placeholder becomes a notice saying so rather than vanishing: from the
@@ -1438,7 +1390,7 @@ transport.onMessage(async (msg) => {
     const inThread = msg.threadRootId;
     const room = transport.room(msg.roomId, inThread);
 
-    // Commands are free: no turn, no spend, no budget.
+    // Commands are free: no turn, no spend.
     if (msg.isHuman && msg.content.trim().startsWith("!")) {
       if (await handleCommand(msg, room, sessionKey(msg.roomId, agent, inThread))) return;
     }
@@ -1468,22 +1420,11 @@ transport.onMessage(async (msg) => {
     const turnRoom = transport.room(turnRoomId, turnThreadRoot);
 
     const threadId = routed ? routed.homeThreadId : sessionKey(msg.roomId, agent, outThread);
-    // Spend, budget and tool denials follow the conversation, not the room the
-    // message happened to arrive in.
+    // Tool denials and the working directory follow the conversation, not the
+    // room the message happened to arrive in.
     const turnAgent = routed ? getRoomAgent(routed.homeRoomId) : agent;
     const agentCwd = turnAgent?.workingDirectory ?? roomConfig.defaults?.workingDirectory ?? DEFAULT_CWD;
     const agentModel = turnAgent?.model ?? roomConfig.defaults?.model ?? "opus";
-
-    // Charged where the turn runs, which for a relayed answer is the room that
-    // asked the question rather than the shared room it came back through.
-    const budget = overDailyBudget(turnRoomId, turnAgent);
-    if (budget.over) {
-      console.log(`[matrix-cc-bot] daily budget spent in ${turnRoomId}: $${budget.spent.toFixed(2)} of $${budget.cap.toFixed(2)}`);
-      if (budget.announce) {
-        await room.send(`💸 *Daily budget reached ($${budget.spent.toFixed(2)} of $${budget.cap.toFixed(2)}). Quiet until UTC midnight.*`, { notice: true }).catch(() => {});
-      }
-      return;
-    }
 
     if (routed) {
       stmtBridgeHop.run(routed.relayRootId);

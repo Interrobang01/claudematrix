@@ -11,7 +11,7 @@ continuity is a UUID plus `--resume`, and the transcript lives in Claude Code's
 own storage, not here.
 
 - **Stack:** TypeScript, Node 22, matrix-bot-sdk, better-sqlite3, node-cron.
-- **Entry point:** `src/index.ts` — routing, sessions, spend, the relay.
+- **Entry point:** `src/index.ts` — routing, sessions, the relay.
 - **Transport:** `src/matrix.ts` — presents a `Room` you can `send()` to and a
   `Msg` you can `edit()`/`reply()`/`delete()`. The policy code above it never
   touches Matrix.
@@ -67,7 +67,7 @@ room message → gating → session key → claude -p --resume <uuid> → messag
 ## Layout
 
 ```
-src/index.ts              routing, sessions, spend, relay, commands, cron
+src/index.ts              routing, sessions, relay, commands, cron
 src/matrix.ts             transport
 src/relay.ts              <name> parsing and rendering
 room-config.json          per-room agents (gitignored, hot-reloaded)

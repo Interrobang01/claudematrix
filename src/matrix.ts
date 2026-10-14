@@ -3,7 +3,7 @@
 // The point of this module is that the rest of the gateway does not know it
 // exists. It presents the two shapes index.ts already used — a room you can
 // `.send()` to, and a message you can `.edit()`, `.reply()` to and `.delete()`
-// — so the policy code above the transport (mention gating, spend ceilings,
+// — so the policy code above the transport (mention gating,
 // turn queueing, session groups, the sibling relay) never touches Matrix at all.
 //
 // Four things a chat transport is often assumed to provide, and does not here:
@@ -197,9 +197,9 @@ export class MatrixTransport {
           sender: event.sender,
           senderName,
           content: isFile ? "" : body,
-          // No bot flag exists in Matrix. Absent an explicit list, treat every
-          // sender as human — the fail-safe direction, since the bot-turn
-          // budget only ever suppresses turns.
+          // No bot flag exists in Matrix. Absent an explicit list every sender
+          // counts as human, so a room that admits siblings needs `humans` set
+          // or a sibling could answer a confirmation.
           isHuman: humans ? humans.has(event.sender) : true,
           mentionsUs: this.mentionsUs(event),
           attachments,

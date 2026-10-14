@@ -9,8 +9,7 @@
       "model": "sonnet",
       "replyInThread": true,
       "humans": ["@you:example.org"],
-      "relayRoom": "!YOUR_SHARED_ROOM:example.org",
-      "maxCostUsdPerDay": 25
+      "relayRoom": "!YOUR_SHARED_ROOM:example.org"
     },
     "!YOUR_SHARED_ROOM:example.org": {
       "name": "commons",
@@ -20,11 +19,9 @@
       "model": "sonnet",
       "replyInThread": true,
       "requireMention": true,
-      "mentionPatterns": ["(^|\\s)@?myagent\\b"],
       "allowBots": true,
       "humans": ["@you:example.org"],
-      "fetchHistory": false,
-      "maxCostUsdPerDay": 20
+      "fetchHistory": false
     }
   },
   "defaults": {
