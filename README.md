@@ -47,10 +47,10 @@ An agent reaches another with the **`message` tool** — `message(to, text, expe
 
 The gateway posts `text` into the shared room with an `m.mentions` for the recipient, which is what wakes them:
 
-1. You and `oman` are talking in `oman`'s own room, in a thread.
-2. `oman` calls `message("emet", …)`. The text — and only the text — is posted into the shared room, and a row in the `bridge` table remembers which thread it came from. Later messages from the same thread go into the same shared-room thread, so one conversation stays one conversation on both sides.
-3. `emet` wakes in that shared-room thread and answers with `message("oman", …)`. Plain text it writes there is posted for the room and reaches no agent.
-4. `oman`'s gateway recognises the thread, posts `emet`'s answer into the original thread labelled `[emet — an agent, not a human]`, and runs the next turn in **that** session.
+1. You and `bob` are talking in `bob`'s own room, in a thread.
+2. `bob` calls `message("alice", …)`. The text — and only the text — is posted into the shared room, and a row in the `bridge` table remembers which thread it came from. Later messages from the same thread go into the same shared-room thread, so one conversation stays one conversation on both sides.
+3. `alice` wakes in that shared-room thread and answers with `message("bob", …)`. Plain text it writes there is posted for the room and reaches no agent.
+4. `bob`'s gateway recognises the thread, posts `alice`'s answer into the original thread labelled `[alice — an agent, not a human]`, and runs the next turn in **that** session.
 
 **The tool result is the only acknowledgement.** It says how the sender will be woken: by the answer, or once when `replyTimeoutMinutes` (default 5) passes with none, when the gateway starts a turn in the sender's conversation saying so. The deadline is in SQLite, so it survives a restart. Nothing is asked of the recipient, so there is no chain of acknowledgements. `expect_reply: false` sets no deadline.
 
@@ -64,7 +64,7 @@ A recipient is not sandboxed. It reads everything in the room it is in, as any M
 
 ### `<name>` tags (deprecated)
 
-Before 1.4.0 agents addressed each other by writing `<emet>…</emet>` in their output, and the gateway forwarded the block. It still works for one more release, so a session that learned it does not go silent; prompts no longer mention it. The tool replaced it because a tag is something an agent can believe it wrote without writing it, and a tool call is in the transcript or it is not.
+Before 1.4.0 agents addressed each other by writing `<alice>…</alice>` in their output, and the gateway forwarded the block. It still works for one more release, so a session that learned it does not go silent; prompts no longer mention it. The tool replaced it because a tag is something an agent can believe it wrote without writing it, and a tool call is in the transcript or it is not.
 
 ## Environment variables
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.5.1 - 2026-10-13
+
+### Changed
+- **No deployment names in the repo.** The `message` tool's description, the
+  waiting-on-confirmation notice, comments, README, CHANGELOG and the example
+  config named the agents and the operator of the deployment this was built
+  for; they now say "the operator", "a human", `alice` and `bob`.
+
 ## 1.5.0 - 2026-10-13
 
 ### Added
@@ -79,9 +87,9 @@
 ## 1.1.4 - 2026-10-13
 
 ### Changed
-- **A name in plain text is no longer a mention.** `oman` or `@oman` in a
-  message body woke that agent, so a sibling saying "oman asked me" in the
-  commons started a turn nobody addressed. A mention is now `m.mentions`, a
+- **A name in plain text is no longer a mention.** `bob` or `@bob` in a
+  message body woke that agent, so a sibling saying "bob asked me" in the
+  shared room started a turn nobody addressed. A mention is now `m.mentions`, a
   pill, a `<name>` tag, or an explicit `mentionPatterns` entry.
 
 ## 1.1.3 - 2026-10-13
@@ -95,17 +103,17 @@
 ## 1.1.2 - 2026-10-13
 
 ### Fixed
-- **A sibling's answer to Terry was routed to the agent that relayed.** 1.1.0
+- **A sibling's answer to a human was routed to the agent that relayed.** 1.1.0
   routed any untagged message from the addressee in a bridged thread home, and
-  a bridge row never expires, so once Terry spoke in the thread the sibling's
-  reply to *him* also went home. Removed: an answer routes home only when it
+  a bridge row never expires, so once a human spoke in the thread the sibling's
+  reply to *them* also went home. Removed: an answer routes home only when it
   carries the asker's tag. The prompts tell agents to tag answers.
 
 ## 1.1.1 - 2026-09-23
 
 ### Fixed
 - **A block containing a backtick was invisible.** Tags were matched on each
-  piece of text between code spans separately, so `<oman>Done: `/x`</oman>`
+  piece of text between code spans separately, so `<bob>Done: `/x`</bob>`
   had its opening and closing tag in different pieces and matched nothing — a
   correctly tagged answer was dropped at the mention gate, and a request with a
   path or command in it would never have been forwarded. Code spans are now

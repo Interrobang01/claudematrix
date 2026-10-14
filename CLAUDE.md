@@ -66,7 +66,7 @@ room message → gating → session key → claude -p --resume <uuid> → messag
   as a turn by a sibling sharing the room.
 - **Only an addressed message is routed home from a bridged thread.** A bridge
   row lives as long as its thread, so "anything from the addressee counts"
-  (1.1.0) also caught the addressee answering Terry there. Removed in 1.1.2.
+  (1.1.0) also caught the addressee answering a human there. Removed in 1.1.2.
 - **Verify behaviour, not the config value.** This codebase has a history of
   keys that were read by nothing (`replyInThread` sat inert in the config for
   months) and of configs that silently failed to load. New config keys need a

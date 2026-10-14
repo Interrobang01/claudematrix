@@ -55,7 +55,7 @@ if (!(db.prepare("PRAGMA table_info(threads)").all() as any[]).some((c) => c.nam
 // that is the only room its account can post into — every room here is
 // `invite: 100` and every agent is power level 0, so no agent can open a
 // private room with another even if it wanted to. The shared room is therefore
-// also the log: every inter-agent message is visible in one room Terry is in,
+// also the log: every inter-agent message is visible in one room the operator is in,
 // and that falls out of the power levels rather than needing its own mechanism.
 //
 // The cost is that the reply arrives in the shared room, a long way from the
@@ -516,7 +516,7 @@ function runClaudeStreaming(opts: {
 // the answer is the next message in the room from somebody on the `humans`
 // list. What the buttons in the Discord era were
 // actually buying is untouched: the question is asked in the agent's own room,
-// where nobody but Terry speaks, and the answer carries his MXID as its sender.
+// where nobody but the operator speaks, and the answer carries their MXID as its sender.
 async function sendAskPrompt(
   room: Room,
   threadId: string,
@@ -532,8 +532,8 @@ async function sendAskPrompt(
     );
     entry.lastBotMessageId = botReply.id;
   }
-  // Until Terry answers, this session takes nothing from anyone else. The room
-  // used to carry this by itself — only he could speak here — and once a
+  // Until a human answers, this session takes nothing from anyone else. The room
+  // used to carry this by itself — only the operator could speak here — and once a
   // sibling's words can be relayed in, it cannot.
   entry.awaitingAnswer = Date.now();
   saveEntry(threadId, entry);
@@ -778,8 +778,8 @@ type RoomConfig = {
    *
    *  It is also the only thing that can answer a confirmation — see
    *  `awaitingAnswer`. That used to be guaranteed by the room instead: nobody
-   *  but Terry could speak in an agent's own room, so anything arriving there
-   *  was his. Relaying puts a sibling's words into that room, which makes the
+   *  but the operator could speak in an agent's own room, so anything arriving
+   *  there was theirs. Relaying puts a sibling's words into that room, which makes the
    *  room a worse piece of evidence than it was, and this list the ground truth
    *  it was standing in for. */
   humans?: string[];
@@ -814,8 +814,8 @@ type RoomConfig = {
   replyTimeoutMinutes?: number;
   /** Start a thread on every top-level message here, so each exchange gets its
    *  own bounded session. Off by default, which leaves the room behaving exactly
-   *  as it did: threads are then opt-in, and Terry starts one by hand when he
-   *  wants a fresh context. A message *inside* a thread gets its own session
+   *  as it did: threads are then opt-in, and a human starts one by hand to get
+   *  a fresh context. A message *inside* a thread gets its own session
    *  either way — that does not need enabling, because it cannot happen by
    *  accident. */
   replyInThread?: boolean;
@@ -953,14 +953,14 @@ function getRoomAgent(roomId: string): RoomConfig | null {
 }
 
 // Which row a turn's session lives under. Rooms sharing a `sessionGroup` share
-// one session: an agent working in the commons can ask for a confirmation on its
+// one session: an agent working in the shared room can ask for a confirmation on its
 // private room and the same session sees the answer, which is what keeps the
 // private room meaningful instead of merely quieter.
 //
 // A thread overrides the group and gets a session of its own. That is the point
 // of threading a conversation — a bounded context you clear by starting another
 // one — but note what it costs: a thread lives in exactly one room, so an
-// exchange threaded in the commons can no longer ask for confirmation in the
+// exchange threaded in the shared room can no longer ask for confirmation in the
 // agent's private room and see the answer. Top-level traffic keeps the group and
 // keeps that property. Thread deliberately.
 function sessionKey(roomId: string, agent: RoomConfig | null, threadRootId?: string): string {
@@ -972,11 +972,10 @@ function resolveSystemPromptMode(agent: RoomConfig | null): SystemPromptMode {
   return agent?.systemPromptMode ?? roomConfig.defaults?.systemPromptMode ?? "append";
 }
 
-// A bare name in message text has to route on its own. An agent writing "@emet"
-// produces no ping — a Matrix mention is a pill or an `m.mentions` field, and a
-// model's text is posted verbatim — so routing between agents matches text.
-// The `<name>` block is the form siblings actually use; this stays for a human
-// typing a name by hand.
+// Opt-in regexes over the message text, for a deployment that wants a typed
+// name to count as a mention. None is set by default: a name in prose woke an
+// agent whenever somebody merely talked about it (removed in 1.1.4). Agents
+// reach each other with the `message` tool, which sets `m.mentions`.
 function matchesMentionPatterns(content: string, agent: RoomConfig | null): boolean {
   const patterns = agent?.mentionPatterns;
   if (!patterns?.length) return false;
@@ -1086,7 +1085,7 @@ const transport = new MatrixTransport(HOMESERVER_URL, ACCESS_TOKEN, STORAGE_PATH
 // localpart of its MXID. Filled in at startup, before any message is handled.
 let selfName = "";
 
-/** `@emet:synapse.example` → `emet`, which is also the name its tag uses. */
+/** `@alice:synapse.example` → `alice`, the name agents address each other by. */
 function localpart(mxid: string): string {
   return mxid.split(":")[0].replace(/^@/, "").toLowerCase();
 }
@@ -1268,8 +1267,8 @@ function startScheduledJobs(): void {
 /** Forward every `<name>` block in a turn's output to the room this agent
  *  shares with its siblings, and remember where each one came from.
  *
- *  Only the block travels, never the whole message. A turn is written for Terry
- *  and will be full of context meant for him; what crosses into a room another
+ *  Only the block travels, never the whole message. A turn is written for a
+ *  human and will be full of context meant for them; what crosses into a room another
  *  agent can read is exactly the text the agent wrapped and nothing else. That
  *  is the difference between a tag and a bare @mention, and it is the reason
  *  for the tag.
@@ -1624,8 +1623,8 @@ transport.onMessage(async (msg) => {
 
     // An answer to a block this agent relayed must carry our tag like any other
     // message. 1.1.0 routed a sibling's untagged message home too, but a bridge
-    // row lives as long as its thread, so once Terry joined the thread the
-    // sibling's answers *to him* went home as well. Untagged is now not for us.
+    // row lives as long as its thread, so once a human joined the thread the
+    // sibling's answers *to them* went home as well. Untagged is now not for us.
     if (agent) {
       if ((agent.requireMention ?? false) && !isMentioned) return;
     } else if (isMentioned) {
@@ -1666,7 +1665,7 @@ transport.onMessage(async (msg) => {
     // this point is the ordinary path with a different room and session.
     const bridge = inThread ? lookupBridge(inThread) : null;
     if (bridge && !fromBot) {
-      // Terry speaking in a bridged thread is Terry in the shared room, not an
+      // A human speaking in a bridged thread is a human in the shared room, not an
       // answer from a sibling. Routing it home would forge the one distinction
       // the whole arrangement rests on.
       console.log(`[matrix-cc-bot] human message in bridged thread ${inThread!.slice(0, 8)}… — not routed home`);
@@ -1705,7 +1704,7 @@ transport.onMessage(async (msg) => {
     // being dropped on the floor — it is told so, in the thread it came from.
     if (entry.awaitingAnswer && !msg.isHuman) {
       console.log(`[matrix-cc-bot] ${threadId} is awaiting a confirmation — not taking a relayed turn`);
-      await room.send("*Waiting on Terry. Nothing here will be read until he answers.*", { notice: true }).catch(() => {});
+      await room.send("*Waiting on a human to answer a confirmation. Nothing here will be read until then.*", { notice: true }).catch(() => {});
       return;
     }
     if (entry.awaitingAnswer && msg.isHuman) {
@@ -1755,13 +1754,13 @@ transport.onMessage(async (msg) => {
       : "";
 
     // Once several speakers share a room the model has no other way to tell who
-    // is talking, and who is talking is the whole of the routing. Only Terry's
-    // word is Terry's, and this label is how that stays checkable.
+    // is talking, and who is talking is the whole of the routing. Only a human's
+    // word is a human's, and this label is how that stays checkable.
     // Who spoke is `[Name]`; who a message is *for* is the `<name>` tag, and the
     // two are never merged. A relayed answer is labelled even though the room it
     // lands in admits no bots, because it is exactly there that the label is
     // load-bearing: it is the only thing separating a sibling's words from
-    // Terry's in the room where his word is authority.
+    // the operator's in the room where their word is authority.
     const label = fromBot ? `${msg.senderName} — an agent, not a human` : msg.senderName;
     const body = (routed || (agent?.allowBots ?? false)) ? `[${label}] ${content}` : content;
     let userMessage = body;
@@ -1772,7 +1771,7 @@ transport.onMessage(async (msg) => {
     }
 
     // A relayed answer is put into the home thread verbatim before the turn
-    // runs, so the conversation Terry is reading stays readable: he sees what
+    // runs, so the conversation the operator is reading stays readable: they see what
     // the sibling actually said, not the agent's account of it afterwards.
     if (routed) {
       await turnRoom.send(userMessage).catch((err) =>

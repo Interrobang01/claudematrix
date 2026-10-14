@@ -3,7 +3,7 @@
 // An agent addresses somebody by wrapping what it wants them to read in a tag
 // named after them:
 //
-//     <emet>survey X and leave it in /srv/emet-share</emet>
+//     <alice>survey X and leave the summary in the shared folder</alice>
 //
 // The tag always names the *addressee*, never the speaker; who spoke is the
 // `[Name]` prefix the gateway puts on an incoming message, and the two are kept
@@ -14,7 +14,7 @@
 // what leaves a private room is exactly what the agent chose to send rather
 // than whatever else happened to share a line with a name. It survives multiple
 // lines and code. And it reads the same in both directions, so the same mark
-// that sends a request also marks the answer as text that is not Terry's.
+// that sends a request also marks the answer as text that is not a human's.
 //
 // Addressing is local by default: in a room both parties are already in, the
 // tag is only a wake signal. A room with `relayRoom` set also *forwards* the
@@ -49,14 +49,14 @@ const CODE = /```[\s\S]*?```|`[^`\n]*`/g;
 type TagMatch = { start: number; end: number; name: string; body: string };
 
 /** Every `<name>...</name>` in `text` whose tags are outside code. An agent
- *  pasting `<emet>` into a code block is showing somebody the syntax, not
+ *  pasting `<alice>` into a code block is showing somebody the syntax, not
  *  using it — but code *inside* a block is ordinary content, and the block
  *  still counts.
  *
  *  Code spans are blanked in a same-length copy and the tags are found there,
  *  so positions line up and the body is sliced from the original. This used to
  *  split the text at code spans and match each piece on its own, which made any
- *  block containing a backtick invisible: `<oman>Done: `/srv/x.md`</oman>` has
+ *  block containing a backtick invisible: `<bob>Done: `/srv/x.md`</bob>` has
  *  its opening and closing tags in different pieces. That silently dropped a
  *  correctly tagged answer on 2026-09-22 and would have refused to forward any
  *  request with a path or a command in it. */
@@ -89,7 +89,7 @@ export function addressesUs(text: string, self: string): boolean {
 }
 
 /** Matrix clients sanitize incoming HTML against the spec's allowed-tag list,
- *  so `<emet>` would be dropped by Element and the block would render as
+ *  so `<alice>` would be dropped by Element and the block would render as
  *  unmarked prose — while the plaintext `body` beside it kept the literal tags.
  *  Rendering it as a labelled quote instead keeps the two consistent and keeps
  *  the routing visible to the person reading the room. */

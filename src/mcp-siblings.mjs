@@ -20,14 +20,14 @@ const TOKEN = process.env.SIBLINGS_TOKEN;
 const TOOL = {
   name: "message",
   description:
-    "Send a message to a sibling agent (oman, emet or shaliach). It is posted in the commons, " +
-    "where Terry can read it too, and only the text you pass here leaves this conversation. " +
+    "Send a message to another agent. It is posted in the shared room, where the humans " +
+    "there can read it too, and only the text you pass here leaves this conversation. " +
     "The result says whether you will be woken: by their answer, or once after a timeout if none comes. " +
     "Set expect_reply to false for something that needs no answer.",
   inputSchema: {
     type: "object",
     properties: {
-      to: { type: "string", description: "The sibling's name, e.g. \"emet\"." },
+      to: { type: "string", description: "The other agent's name: the localpart of its Matrix ID, e.g. \"alice\"." },
       text: { type: "string", description: "Exactly what they should read. Markdown is rendered." },
       expect_reply: { type: "boolean", description: "Default true. False: no timeout, nothing wakes you about it." },
     },
