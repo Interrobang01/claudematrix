@@ -1514,7 +1514,20 @@ transport.onMessage(async (msg) => {
       saveEntry(threadId, entry);
     }
 
-    releaseTurn = await acquireTurn(entry.sessionId);
+    // A message for a session that is mid-turn waits for the turn to end; it
+    // cannot be added to it. Say so where the turn will run, or a message
+    // queued behind a long tool call looks like one that never arrived.
+    // Taken before anything is awaited, so two arrivals keep their order.
+    const lane = lanes.get(entry.sessionId);
+    const busy = lane?.busy ?? false;
+    const full = busy && lane!.waiting.length >= MAX_QUEUE_DEPTH;
+    const turn = acquireTurn(entry.sessionId);
+    if (busy) {
+      await turnRoom.send(full
+        ? "*Dropped: too many messages already waiting on a running turn.*"
+        : "*Queued behind a running turn; it will be read when that turn ends.*", { notice: true }).catch(() => {});
+    }
+    releaseTurn = await turn;
     if (!releaseTurn) {
       console.log(`[matrix-cc-bot] queue full for ${entry.sessionId} — dropping message ${msg.id}`);
       return;

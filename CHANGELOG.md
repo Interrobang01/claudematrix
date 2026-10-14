@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.2 - 2026-10-13
+
+### Added
+- **A message that waits on a running turn says so.** A session runs one turn
+  at a time and a message cannot join a turn already running, so one arriving
+  mid-turn (a sibling's answer during a long tool call, say) waited silently.
+  It now gets an `m.notice` where the turn will run: queued, or dropped when
+  `MAX_QUEUE_DEPTH` messages are already waiting.
+
 ## 1.2.1 - 2026-10-13
 
 ### Fixed
