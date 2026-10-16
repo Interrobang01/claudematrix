@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.6.0 - 2026-10-15
+
+### Changed
+- **Every scheduled firing is its own session.** A job without `fresh` used to
+  resume the room's session, so each run carried every earlier run; one daily
+  job's session had reached 176K tokens over seven weeks with no reset. Now
+  each firing starts a new session, and a reply in the thread of the message
+  it posted resumes that session, so feedback on a scheduled post meets the
+  turn that wrote it. `fresh: true` still means unpersisted, and its post has
+  no session behind it.
+
 ## 1.5.1 - 2026-10-13
 
 ### Changed

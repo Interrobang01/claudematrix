@@ -157,6 +157,7 @@ const stmtUpsert = db.prepare(
    VALUES (@threadId, @sessionId, @cwd, @model, @createdAt, @started, @lastBotMessageId, @awaitingAnswer)`,
 );
 const stmtAll = db.prepare("SELECT * FROM threads");
+const stmtDelete = db.prepare("DELETE FROM threads WHERE threadId = ?");
 
 function rowToEntry(row: any): ThreadEntry {
   return {
@@ -1230,12 +1231,13 @@ function startScheduledJobs(): void {
         }
         console.log(`[matrix-cc-bot] cron fired for ${jobName}`);
 
+        // Every firing is its own conversation. Resuming the room's session made
+        // each run read every earlier run, and nothing ever cut it short.
         const room = transport.room(roomId);
-        const threadId = job.fresh ? `cron:${runKey}:${startedAt}` : sessionKey(roomId, cfg);
+        const threadId = `cron:${runKey}:${startedAt}`;
         const entry = getOrCreate(threadMap, threadId,
-          cfg.workingDirectory ?? roomConfig.defaults?.workingDirectory ?? DEFAULT_CWD,
-          job.fresh ? undefined : cfg.sessionId);
-        if (job.fresh) entry.model = cfg.model ?? roomConfig.defaults?.model ?? entry.model;
+          cfg.workingDirectory ?? roomConfig.defaults?.workingDirectory ?? DEFAULT_CWD);
+        entry.model = cfg.model ?? roomConfig.defaults?.model ?? entry.model;
 
         // Cron takes the same lane as a message: `running` only fills once a child
         // has spawned, so checking it alone races a turn that is still starting.
@@ -1251,6 +1253,16 @@ function startScheduledJobs(): void {
           });
           // A failed run leaves the mark where it was, so the next one rereads.
           if (ok) stmtRunPut.run(runKey, startedAt);
+          // What the run posted is a top-level message, and a reply in its thread
+          // should continue the conversation that wrote it rather than meet it cold.
+          // The `cron:` key is never looked up again, so the session moves over.
+          if (ok && !job.fresh && entry.lastBotMessageId) {
+            const replyKey = `thread:${entry.lastBotMessageId}`;
+            threadMap[replyKey] = entry;
+            saveEntry(replyKey, entry);
+            delete threadMap[threadId];
+            stmtDelete.run(threadId);
+          }
         } catch (err) {
           console.error(`[matrix-cc-bot] cron error for ${jobName}:`, (err as Error).message);
         } finally {
