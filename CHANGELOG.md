@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.6.0 - 2026-10-15
+## 1.6.0 - 2026-10-16
 
 ### Changed
 - **Every scheduled firing is its own session.** A job without `fresh` used to
@@ -10,6 +10,12 @@
   it posted resumes that session, so feedback on a scheduled post meets the
   turn that wrote it. `fresh: true` still means unpersisted, and its post has
   no session behind it.
+
+### Fixed
+- **`!model` and `!cd` did nothing in a configured room.** Every turn
+  reapplied the room's model and directory to the session, so the command
+  answered "set" and the next turn ran on the config value. The room config is
+  now only where a conversation starts.
 
 ## 1.5.1 - 2026-10-13
 

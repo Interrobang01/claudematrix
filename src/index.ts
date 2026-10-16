@@ -1705,10 +1705,14 @@ transport.onMessage(async (msg) => {
     // Only a room-level session may be seeded from the configured `sessionId`.
     // Seeding a thread with it would make every new thread resume the one
     // long-lived session it was supposed to be an escape from.
+    // The room's model and directory are where a conversation starts, not a
+    // setting it is held to: overwriting them every turn made `!model` and `!cd`
+    // answer "set" and then do nothing.
+    const isNew = !threadMap[threadId] && !stmtGet.get(threadId);
     const entry = turnAgent
       ? getOrCreate(threadMap, threadId, agentCwd, (routed || outThread) ? undefined : turnAgent.sessionId)
       : getOrCreate(threadMap, threadId, DEFAULT_CWD);
-    if (turnAgent) { entry.cwd = agentCwd; entry.model = agentModel; }
+    if (turnAgent && isNew) { entry.cwd = agentCwd; entry.model = agentModel; saveEntry(threadId, entry); }
 
     // A confirmation is on screen in this session and has not been answered.
     // Only a human can answer one: the `humans` list is the ground truth that
