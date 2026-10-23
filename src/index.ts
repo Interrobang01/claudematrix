@@ -106,6 +106,10 @@ const stmtPendingDue = db.prepare("SELECT * FROM pending WHERE deadline <= ? ORD
 db.exec("CREATE TABLE IF NOT EXISTS schedule_runs (key TEXT PRIMARY KEY, lastRun INTEGER NOT NULL)");
 const stmtRunGet = db.prepare("SELECT lastRun FROM schedule_runs WHERE key = ?");
 const stmtRunPut = db.prepare("INSERT OR REPLACE INTO schedule_runs (key, lastRun) VALUES (?, ?)");
+db.exec("CREATE TABLE IF NOT EXISTS schedule_count (key TEXT PRIMARY KEY, n INTEGER NOT NULL)");
+const stmtCountNext = db.prepare(
+  "INSERT INTO schedule_count (key, n) VALUES (?, 1) ON CONFLICT(key) DO UPDATE SET n = n + 1 RETURNING n",
+);
 
 type Pending = {
   relayRootId: string;
@@ -753,6 +757,12 @@ type RoomSchedule = {
    *  in it changed since the job last succeeded, and the changed files are
    *  listed at the end of the prompt. */
   newTranscripts?: string;
+  /** Post this as a top-level message and run the job inside its thread, so
+   *  every reply to the post is in the thread and resumes the session. Without
+   *  it a reply to the post is top-level, and in a `replyInThread` room opens a
+   *  conversation of its own. `{n}` is the firing's number, `{date}` its date
+   *  in `timezone`. Ignored with `fresh`, which has no session to resume. */
+  thread?: string;
 };
 
 type SystemPromptMode = "append" | "replace";
@@ -1198,6 +1208,15 @@ function changedTranscripts(dir: string, since: number): string[] {
     .map(({ f }) => f);
 }
 
+/** Rekey a conversation. The old key is never looked up again. */
+function moveEntry(from: string, to: string): string {
+  threadMap[to] = threadMap[from];
+  saveEntry(to, threadMap[to]);
+  delete threadMap[from];
+  stmtDelete.run(from);
+  return to;
+}
+
 function startScheduledJobs(): void {
   for (const task of scheduledTasks) task.stop();
   scheduledTasks.length = 0;
@@ -1211,7 +1230,7 @@ function startScheduledJobs(): void {
         console.error(`[matrix-cc-bot] invalid cron for "${jobName}": ${cronExpr}`);
         continue;
       }
-      console.log(`[matrix-cc-bot] scheduling "${jobName}" → "${cronExpr}"${timezone ? ` (${timezone})` : ""}${job.fresh ? " fresh" : ""}${job.newTranscripts ? ` if-new:${job.newTranscripts}` : ""}`);
+      console.log(`[matrix-cc-bot] scheduling "${jobName}" → "${cronExpr}"${timezone ? ` (${timezone})` : ""}${job.fresh ? " fresh" : ""}${job.newTranscripts ? ` if-new:${job.newTranscripts}` : ""}${job.thread && !job.fresh ? " threaded" : ""}`);
 
       const task = cron.schedule(cronExpr, async () => {
         const runKey = `${roomId}:${job.name ?? cronExpr}`;
@@ -1233,8 +1252,8 @@ function startScheduledJobs(): void {
 
         // Every firing is its own conversation. Resuming the room's session made
         // each run read every earlier run, and nothing ever cut it short.
-        const room = transport.room(roomId);
-        const threadId = `cron:${runKey}:${startedAt}`;
+        let room = transport.room(roomId);
+        let threadId = `cron:${runKey}:${startedAt}`;
         const entry = getOrCreate(threadMap, threadId,
           cfg.workingDirectory ?? roomConfig.defaults?.workingDirectory ?? DEFAULT_CWD);
         entry.model = cfg.model ?? roomConfig.defaults?.model ?? entry.model;
@@ -1247,21 +1266,28 @@ function startScheduledJobs(): void {
           return;
         }
         try {
+          // The thread exists before the turn does, so everything the turn posts
+          // lands in it and the session is keyed to it from the start.
+          if (job.thread && !job.fresh) {
+            const { n } = stmtCountNext.get(runKey) as { n: number };
+            const date = new Intl.DateTimeFormat("en-CA", { timeZone: timezone, year: "numeric", month: "2-digit", day: "2-digit" })
+              .format(new Date(startedAt));
+            const root = await room.send(job.thread.replaceAll("{n}", String(n)).replaceAll("{date}", date));
+            threadId = moveEntry(threadId, `thread:${root.id}`);
+            room = transport.room(roomId, root.id);
+          }
           const ok = await runTurn({
             room, roomId, threadId, entry, agent: cfg,
             prompt, replyTo: undefined, persist: job.fresh ? false : undefined,
           });
           // A failed run leaves the mark where it was, so the next one rereads.
           if (ok) stmtRunPut.run(runKey, startedAt);
-          // What the run posted is a top-level message, and a reply in its thread
-          // should continue the conversation that wrote it rather than meet it cold.
-          // The `cron:` key is never looked up again, so the session moves over.
-          if (ok && !job.fresh && entry.lastBotMessageId) {
-            const replyKey = `thread:${entry.lastBotMessageId}`;
-            threadMap[replyKey] = entry;
-            saveEntry(replyKey, entry);
-            delete threadMap[threadId];
-            stmtDelete.run(threadId);
+          // Without `thread`, what the run posted is a top-level message, and a
+          // reply in its thread should continue the conversation that wrote it
+          // rather than meet it cold. A reply *to* it is not in its thread, and
+          // does not reach this; `thread` is the fix for that.
+          if (ok && !job.fresh && !job.thread && entry.lastBotMessageId) {
+            moveEntry(threadId, `thread:${entry.lastBotMessageId}`);
           }
         } catch (err) {
           console.error(`[matrix-cc-bot] cron error for ${jobName}:`, (err as Error).message);

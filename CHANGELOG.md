@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.7.0 - 2026-10-22
+
+### Added
+- **`thread` on a scheduled job.** The gateway posts the given text as a
+  top-level message and runs the job inside its thread (`{n}` is the firing's
+  number, `{date}` its date in the job's timezone). Without it, the obvious
+  way to answer a scheduled post — a reply to it — is a top-level message, and
+  in a `replyInThread` room that opens a thread of its own with a new session,
+  so the session that wrote the post was never reached. With `thread`, the
+  post is already inside a thread, a reply there carries the thread relation,
+  and the room keeps one top-level message per firing.
+
 ## 1.6.0 - 2026-10-16
 
 ### Changed

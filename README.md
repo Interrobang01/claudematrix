@@ -98,7 +98,7 @@ Before 1.4.0 agents addressed each other by writing `<alice>…</alice>` in thei
 | `mcpConfig` | Path passed to `--mcp-config`. A claude.ai connector declared there as a `claudeai-proxy` server loads before the first model request instead of racing it. |
 | `disallowedTools` | Passed to `--disallowed-tools`, by name rather than as an allowlist, so a connector authenticated later cannot appear by surprise. |
 | `sessionGroup` | Rooms sharing a group share one session. A thread overrides it. |
-| `schedule` | `{ cron, timezone, prompt }` for a scheduled turn, or a list of them. `name` keys the job; each firing is a new session, and a reply in the thread of what it posted continues that session; `fresh: true` also leaves no transcript (and no thread to continue); `newTranscripts: <dir>` fires only if a `*.jsonl` there changed since the job last succeeded, and lists the changed files at the end of the prompt. |
+| `schedule` | `{ cron, timezone, prompt }` for a scheduled turn, or a list of them. `name` keys the job; each firing is a new session, and a reply in the thread of what it posted continues that session; `fresh: true` also leaves no transcript (and no thread to continue); `newTranscripts: <dir>` fires only if a `*.jsonl` there changed since the job last succeeded, and lists the changed files at the end of the prompt; `thread: "Digest #{n} — {date}"` posts that line first and runs the job inside its thread, so a reply to the post is in its thread and resumes the session. |
 | `contextFile` | A file prepended to the system prompt, hot-reloaded with the config. |
 
 Top level: `rooms`, `defaults`, `defaultHumans`, `configuredRoomsOnly`.
