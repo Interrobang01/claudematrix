@@ -75,7 +75,7 @@ A recipient is not sandboxed. It reads everything in the room it is in, as any M
 
 ## Room config
 
-`room-config.json`, hot-reloaded on save, gitignored. `channels` / `configuredChannelsOnly` still load as key names; the startup line says whether the file loaded.
+`room-config.json`, hot-reloaded on save, gitignored. `channels` / `configuredChannelsOnly` still load as key names; a file that exists but does not parse stops startup (exit 1), and on reload keeps the previous config with a loud log line.
 
 | Key | What |
 |---|---|

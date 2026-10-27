@@ -776,27 +776,45 @@ function configPath(): string | null {
   return fs.existsSync(CONFIG_PATH) ? CONFIG_PATH : null;
 }
 
+/** Throws if the file exists but does not parse or is not shaped like a config.
+ *  Callers decide: startup exits, a reload keeps what it had. Returning an empty
+ *  config here would drop every `humans` list and every tool denial. */
 function loadRoomConfig(): RoomConfigFile {
-  try {
-    const found = configPath();
-    if (found) {
-      const raw = JSON.parse(fs.readFileSync(found, "utf8"));
-      // `channels` and `configuredChannelsOnly` are what the Discord-era config
-      // called these. The file is gitignored, so a deployment's copy can only be
-      // renamed by hand; both spellings load.
-      return {
-        ...raw,
-        rooms: raw.rooms ?? raw.channels ?? {},
-        configuredRoomsOnly: raw.configuredRoomsOnly ?? raw.configuredChannelsOnly ?? false,
-      };
-    }
-  } catch (err) {
-    console.error(`[matrix-cc-bot] failed to load ${configPath() ?? "room-config.json"}:`, err);
-  }
-  return { rooms: {} };
+  const found = configPath();
+  if (!found) return { rooms: {} };
+  const raw = JSON.parse(fs.readFileSync(found, "utf8"));
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("top level is not an object");
+  const rooms = raw.rooms ?? raw.channels ?? {};
+  if (!rooms || typeof rooms !== "object" || Array.isArray(rooms)) throw new Error("`rooms` is not an object");
+  // `channels` and `configuredChannelsOnly` are what the Discord-era config
+  // called these. The file is gitignored, so a deployment's copy can only be
+  // renamed by hand; both spellings load.
+  return {
+    ...raw,
+    rooms,
+    configuredRoomsOnly: raw.configuredRoomsOnly ?? raw.configuredChannelsOnly ?? false,
+  };
 }
 
-let roomConfig = loadRoomConfig();
+/** Reload, keeping the previous config if the new file is bad. */
+function reloadRoomConfig(): boolean {
+  try {
+    roomConfig = loadRoomConfig();
+    return true;
+  } catch (err) {
+    console.error(`[matrix-cc-bot] !!! ${CONFIG_PATH} is invalid — KEEPING THE PREVIOUS CONFIG:`, err);
+    return false;
+  }
+}
+
+let roomConfig: RoomConfigFile;
+try {
+  roomConfig = loadRoomConfig();
+} catch (err) {
+  console.error(`[matrix-cc-bot] ${CONFIG_PATH} exists but cannot be loaded; refusing to start without its humans lists:`, err);
+  process.exit(1);
+}
+
 
 // --- Context File Cache ---
 
@@ -862,7 +880,7 @@ fs.watchFile(CONFIG_PATH, { interval: 5000 }, (curr) => {
   // A watched file that does not exist reports once anyway, with zeroed stats.
   if (curr.mtimeMs === 0) return;
   console.log(`[matrix-cc-bot] reloading ${path.basename(CONFIG_PATH)}`);
-  roomConfig = loadRoomConfig();
+  if (!reloadRoomConfig()) return;
   preloadContextFiles();
   warnOnBadSessionIds();
   // Everything `!reload-config` does. The `humans` lists and the schedules are
@@ -1073,7 +1091,10 @@ async function handleCommand(msg: IncomingMessage, room: Room, threadId: string)
     }
 
     case "!reload-config":
-      roomConfig = loadRoomConfig();
+      if (!reloadRoomConfig()) {
+        await room.send("⚠️ *room-config.json is invalid — kept the previous config. See the log.*");
+        return true;
+      }
       preloadContextFiles();
       warnOnBadSessionIds();
       applyRoomHumans();
