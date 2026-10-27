@@ -39,8 +39,9 @@ room message → gating → session key → claude -p --resume <uuid> → messag
 - **`--append-system-prompt`, never `--system-prompt`.** Replacing drops Claude
   Code's own tool-use guidance along with everything else. `systemPromptMode:
   "replace"` exists and is opt-in for that reason.
-- **`--disallowed-tools` is variadic.** The prompt goes in `-p` up front, never
-  positionally, or it is swallowed as another rule.
+- **`--disallowed-tools` is variadic, and `-p` is a bare flag.** The prompt is
+  positional: last, after `--`, so neither a variadic option swallows it nor a
+  prompt starting with `-` is parsed as an option.
 - **Deny rules survive `bypassPermissions`; allow rules do not.**
 - **`--session-id` must be a UUID**, and the CLI only says so when a turn runs.
   Startup warns instead.

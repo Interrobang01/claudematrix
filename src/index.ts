@@ -371,7 +371,7 @@ function runClaudeStreaming(opts: {
 }): Promise<RunResult> {
   return new Promise((resolve, reject) => {
     const args = [
-      "-p", opts.prompt,
+      "-p",
       ...(opts.resume ? ["--resume", opts.sessionId] : ["--session-id", opts.sessionId]),
       ...(opts.persist === false ? ["--no-session-persistence"] : []),
       "--model", opts.model,
@@ -386,11 +386,15 @@ function runClaudeStreaming(opts: {
         ? [opts.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", opts.systemPrompt]
         : []),
       // Variadic: every bare word after it is taken as another rule. Safe here
-      // because the prompt is passed with -p up front, never positionally. A rule
-      // matching no known tool only warns, so a typo silently grants what it meant
-      // to withhold — check the log after changing this.
+      // because the prompt is last, after `--`. A rule matching no known tool
+      // only warns, so a typo silently grants what it meant to withhold — check
+      // the log after changing this.
       ...(opts.disallowedTools?.length ? ["--disallowed-tools", ...opts.disallowedTools] : []),
       ...(opts.mcpConfigs?.length ? ["--mcp-config", ...opts.mcpConfigs] : []),
+      // `-p` is a bare boolean; the prompt is positional. After `--` so a prompt
+      // that starts with `-` is not parsed as an option.
+      "--",
+      opts.prompt,
     ];
 
     const child = spawn(opts.claudeBin, args, {
