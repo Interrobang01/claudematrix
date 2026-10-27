@@ -100,6 +100,11 @@ const stmtPendingPut = db.prepare(
    VALUES (@relayRootId, @toName, @homeRoomId, @homeThreadRootId, @homeThreadId, @sentAt, @deadline)`,
 );
 const stmtPendingClear = db.prepare("DELETE FROM pending WHERE relayRootId = ? AND toName = ?");
+// Messages that arrived for a conversation while it waited on a human's answer
+// to a confirmation. They are read, in order, by the turn that answer starts.
+db.exec("CREATE TABLE IF NOT EXISTS held (id INTEGER PRIMARY KEY AUTOINCREMENT, threadId TEXT NOT NULL, text TEXT NOT NULL)");
+const stmtHeldPut = db.prepare("INSERT INTO held (threadId, text) VALUES (?, ?)");
+const stmtHeldTake = db.prepare("DELETE FROM held WHERE threadId = ? RETURNING text");
 const stmtPendingClaim = db.prepare(
   "DELETE FROM pending WHERE homeThreadId = ? AND toName = ? AND deadline <= ?");
 const stmtPendingDue = db.prepare("SELECT * FROM pending WHERE deadline <= ? ORDER BY deadline");
@@ -1553,16 +1558,23 @@ transport.onMessage(async (msg) => {
 
     // A confirmation is on screen in this session and has not been answered.
     // Only a human can answer one: the `humans` list is the ground truth that
-    // the room used to stand in for. A sibling's message waits rather than
-    // being dropped on the floor — it is told so, in the thread it came from.
+    // the room used to stand in for. A sibling's message is kept, and read by the
+    // turn the human's answer starts. A routed one is also shown in the home
+    // thread, where the operator is, since the thread it came from is not.
+    const label = fromBot ? `${msg.senderName} — an agent, not a human` : msg.senderName;
+    const body = (routed || (agent?.allowBots ?? false)) ? `[${label}] ${content}` : content;
     if (entry.awaitingAnswer && !msg.isHuman) {
-      console.log(`[matrix-cc-bot] ${threadId} is awaiting a confirmation — not taking a relayed turn`);
-      await room.send("*Waiting on a human to answer a confirmation. Nothing here will be read until then.*", { notice: true }).catch(() => {});
+      console.log(`[matrix-cc-bot] ${threadId} is awaiting a confirmation — holding a relayed message`);
+      stmtHeldPut.run(threadId, body);
+      if (routed) await turnRoom.send(body).catch(() => {});
+      await turnRoom.send("*Waiting on a human to answer a confirmation. This will be read once they do.*", { notice: true }).catch(() => {});
       return;
     }
+    let held = "";
     if (entry.awaitingAnswer && msg.isHuman) {
       entry.awaitingAnswer = undefined;
       saveEntry(threadId, entry);
+      held = (stmtHeldTake.all(threadId) as { text: string }[]).map((r) => r.text + "\n\n").join("");
     }
 
     // A message for a session that is mid-turn waits for the turn to end; it
@@ -1606,8 +1618,6 @@ transport.onMessage(async (msg) => {
     // lands in admits no bots, because it is exactly there that the label is
     // load-bearing: it is the only thing separating a sibling's words from
     // the operator's in the room where their word is authority.
-    const label = fromBot ? `${msg.senderName} — an agent, not a human` : msg.senderName;
-    const body = (routed || (agent?.allowBots ?? false)) ? `[${label}] ${content}` : content;
     let userMessage = body;
     if (filePaths.length === 1) {
       userMessage = `${body}\n\nThe user attached a file: ${filePaths[0]}`.trim();
@@ -1629,7 +1639,7 @@ transport.onMessage(async (msg) => {
       threadId,
       entry,
       agent: turnAgent,
-      prompt: history ? `${history}${userMessage}` : userMessage,
+      prompt: held + (history ? `${history}${userMessage}` : userMessage),
       replyTo: routed ? undefined : transport.msg(msg.roomId, msg.id, outThread),
       filePaths,
     });
