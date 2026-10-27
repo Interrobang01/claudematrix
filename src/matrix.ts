@@ -222,10 +222,14 @@ export class MatrixTransport {
   }
 
   private mentionsUs(event: any): boolean {
-    // The spec's intentional-mentions field, when the sender sets it.
-    const m = event.content?.["m.mentions"]?.user_ids;
-    if (Array.isArray(m) && m.includes(this.userId)) return true;
-    // A pill in formatted_body is an <a href="https://matrix.to/#/@user:server">.
+    // The spec's intentional-mentions field is authoritative when present:
+    // a pill in the body then mentions nobody.
+    const mentions = event.content?.["m.mentions"];
+    if (mentions !== undefined && mentions !== null) {
+      const ids = mentions.user_ids;
+      return Array.isArray(ids) && ids.includes(this.userId);
+    }
+    // Absent it, a pill in formatted_body is an <a href="https://matrix.to/#/@user:server">.
     const fb: string = event.content?.formatted_body ?? "";
     // Not the name in plain text: that woke an agent whenever a sibling merely
     // talked about it. Agents address each other with the `message` tool, which sets `m.mentions`.

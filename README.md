@@ -85,7 +85,7 @@ A recipient is not sandboxed. It reads everything in the room it is in, as any M
 | `model` | Passed to `--model`. Overwrites the session's model every turn, so `!model` does not stick in a configured room. |
 | `systemPrompt` / `systemPromptMode` | Appended to Claude Code's own prompt. `"replace"` replaces it, including its tool-use guidance. |
 | `replyInThread` | Open a thread on every top-level message here, giving each exchange its own session. |
-| `requireMention` | Answer only when addressed: `m.mentions` (which the `message` tool sets) or a pill. The agent's name in plain text does not count. |
+| `requireMention` | Answer only when addressed: `m.mentions` (which the `message` tool sets), or a pill when the message has no `m.mentions` at all. The agent's name in plain text does not count. |
 | `allowBots` | Bots may wake this agent unprompted: admit unsolicited messages from senders not on the `humans` list, labelled `[name — an agent, not a human]`. Also gives the room the `message` tool. It is not needed for answers: an addressed answer from an agent this conversation messaged, in its `relayRoom` thread, is routed home regardless. |
 | `humans` | MXIDs that count as human here. Falls back to `defaultHumans`; absent both, everyone is human. |
 | `relayRoom` | The shared room the `message` tool posts into from here. |
