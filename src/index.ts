@@ -100,6 +100,13 @@ const stmtPendingPut = db.prepare(
    VALUES (@relayRootId, @toName, @homeRoomId, @homeThreadRootId, @homeThreadId, @sentAt, @deadline)`,
 );
 const stmtPendingClear = db.prepare("DELETE FROM pending WHERE relayRootId = ? AND toName = ?");
+// Messages that arrived for a conversation while it waited on a human's answer
+// to a confirmation. They are read, in order, by the turn that answer starts.
+db.exec("CREATE TABLE IF NOT EXISTS held (id INTEGER PRIMARY KEY AUTOINCREMENT, threadId TEXT NOT NULL, text TEXT NOT NULL)");
+const stmtHeldPut = db.prepare("INSERT INTO held (threadId, text) VALUES (?, ?)");
+const stmtHeldTake = db.prepare("DELETE FROM held WHERE threadId = ? RETURNING text");
+const stmtPendingClaim = db.prepare(
+  "DELETE FROM pending WHERE homeThreadId = ? AND toName = ? AND deadline <= ?");
 const stmtPendingDue = db.prepare("SELECT * FROM pending WHERE deadline <= ? ORDER BY deadline");
 
 db.exec("CREATE TABLE IF NOT EXISTS schedule_runs (key TEXT PRIMARY KEY, lastRun INTEGER NOT NULL)");
@@ -1163,7 +1170,7 @@ function startScheduledJobs(): void {
 
         // Cron takes the same lane as a message: `running` only fills once a child
         // has spawned, so checking it alone races a turn that is still starting.
-        const release = await acquireTurn(entry.sessionId);
+        const release = await acquireTurn(threadId);
         try {
           // The thread exists before the turn does, so everything the turn posts
           // lands in it and the session is keyed to it from the start.
@@ -1308,38 +1315,45 @@ function siblingsMcpConfig(token: string): string {
   } } });
 }
 
-/** Wake each sender whose sibling has not answered in time. Once each: the
- *  rows are deleted before the turn runs, whatever the turn then does. */
+/** Wake each sender whose sibling has not answered in time. Once each: a wake
+ *  claims its rows (deletes them) only after it holds the lane, so an answer that
+ *  arrives while it waits cancels it, and a later tick cannot wake the same
+ *  conversation again. Wakes run side by side; one busy lane holds up only itself. */
+const wakesInFlight = new Set<string>();
 async function firePendingDeadlines(): Promise<void> {
   const due = stmtPendingDue.all(Date.now()) as Pending[];
-  const seen = new Set<string>();
   for (const p of due) {
-    stmtPendingClear.run(p.relayRootId, p.toName);
     const key = `${p.homeThreadId}\0${p.toName}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
+    if (wakesInFlight.has(key)) continue;
+    wakesInFlight.add(key);
+    wakeSender(p).catch((err) => console.error("[matrix-cc-bot] deadline wake failed:", (err as Error).message))
+      .finally(() => wakesInFlight.delete(key));
+  }
+}
+
+async function wakeSender(p: Pending): Promise<void> {
+  const release = await acquireTurn(p.homeThreadId);
+  try {
+    // Claim: nothing deleted means the answer got here first.
+    if (stmtPendingClaim.run(p.homeThreadId, p.toName, Date.now()).changes === 0) return;
 
     const agent = getRoomAgent(p.homeRoomId);
     const cwd = agent?.workingDirectory ?? roomConfig.defaults?.workingDirectory ?? DEFAULT_CWD;
     const entry = getOrCreate(threadMap, p.homeThreadId, cwd);
-    if (agent) { entry.cwd = cwd; entry.model = agent.model ?? roomConfig.defaults?.model ?? "opus"; }
     const room = transport.room(p.homeRoomId, p.homeThreadRootId ?? undefined);
     const mins = Math.round((Date.now() - p.sentAt) / 60_000);
     console.log(`[matrix-cc-bot] ${p.toName} did not answer ${p.homeThreadId} in ${mins} min — waking it`);
 
     if (entry.awaitingAnswer) {
       await room.send(`*${p.toName} has not answered (${mins} min). Not waking this conversation while it waits on a confirmation.*`, { notice: true }).catch(() => {});
-      continue;
+      return;
     }
-    const release = await acquireTurn(entry.sessionId);
-    try {
-      await runTurn({
-        room, roomId: p.homeRoomId, threadId: p.homeThreadId, entry, agent,
-        prompt: `[gateway] ${p.toName} has not answered your message from ${clock(p.sentAt)} (${mins} min). This is the only reminder.`,
-      });
-    } finally {
-      release();
-    }
+    await runTurn({
+      room, roomId: p.homeRoomId, threadId: p.homeThreadId, entry, agent,
+      prompt: `[gateway] ${p.toName} has not answered your message from ${clock(p.sentAt)} (${mins} min). This is the only reminder.`,
+    });
+  } finally {
+    release();
   }
 }
 
@@ -1575,25 +1589,31 @@ transport.onMessage(async (msg) => {
 
     // A confirmation is on screen in this session and has not been answered.
     // Only a human can answer one: the `humans` list is the ground truth that
-    // the room used to stand in for. A sibling's message waits rather than
-    // being dropped on the floor — it is told so, in the thread it came from.
+    // the room used to stand in for. A sibling's message is kept, and read by the
+    // turn the human's answer starts. A routed one is also shown in the home
+    // thread, where the operator is, since the thread it came from is not.
+    const label = fromBot ? `${msg.senderName} — an agent, not a human` : msg.senderName;
+    const body = (routed || (agent?.allowBots ?? false)) ? `[${label}] ${content}` : content;
     if (entry.awaitingAnswer && !msg.isHuman) {
-      console.log(`[matrix-cc-bot] ${threadId} is awaiting a confirmation — not taking a relayed turn`);
-      await room.send("*Waiting on a human to answer a confirmation. Nothing here will be read until then.*", { notice: true }).catch(() => {});
+      console.log(`[matrix-cc-bot] ${threadId} is awaiting a confirmation — holding a relayed message`);
+      stmtHeldPut.run(threadId, body);
+      if (routed) await turnRoom.send(body).catch(() => {});
+      await turnRoom.send("*Waiting on a human to answer a confirmation. This will be read once they do.*", { notice: true }).catch(() => {});
       return;
     }
+    let held = "";
     if (entry.awaitingAnswer && msg.isHuman) {
       entry.awaitingAnswer = undefined;
       saveEntry(threadId, entry);
+      held = (stmtHeldTake.all(threadId) as { text: string }[]).map((r) => r.text + "\n\n").join("");
     }
 
     // A message for a session that is mid-turn waits for the turn to end; it
     // cannot be added to it. Say so where the turn will run, or a message
     // queued behind a long tool call looks like one that never arrived.
     // Taken before anything is awaited, so two arrivals keep their order.
-    const lane = lanes.get(entry.sessionId);
-    const busy = lane?.busy ?? false;
-    const turn = acquireTurn(entry.sessionId);
+    const busy = lanes.get(threadId)?.busy ?? false;
+    const turn = acquireTurn(threadId);
     if (busy) {
       await turnRoom.send("*Queued behind a running turn; it will be read when that turn ends.*", { notice: true }).catch(() => {});
     }
@@ -1629,8 +1649,6 @@ transport.onMessage(async (msg) => {
     // lands in admits no bots, because it is exactly there that the label is
     // load-bearing: it is the only thing separating a sibling's words from
     // the operator's in the room where their word is authority.
-    const label = fromBot ? `${msg.senderName} — an agent, not a human` : msg.senderName;
-    const body = (routed || (agent?.allowBots ?? false)) ? `[${label}] ${content}` : content;
     let userMessage = body;
     if (filePaths.length === 1) {
       userMessage = `${body}\n\nThe user attached a file: ${filePaths[0]}`.trim();
@@ -1652,7 +1670,7 @@ transport.onMessage(async (msg) => {
       threadId,
       entry,
       agent: turnAgent,
-      prompt: history ? `${history}${userMessage}` : userMessage,
+      prompt: held + (history ? `${history}${userMessage}` : userMessage),
       replyTo: routed ? undefined : transport.msg(msg.roomId, msg.id, outThread),
       filePaths,
     });
