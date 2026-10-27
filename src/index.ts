@@ -6,7 +6,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import Database from "better-sqlite3";
 import cron from "node-cron";
 import {
-  MatrixTransport, MATRIX_MAX_LEN,
+  MatrixTransport,
   type Msg, type Room, type IncomingMessage,
 } from "./matrix.js";
 
@@ -558,10 +558,23 @@ async function downloadAttachment(url: string, filepath: string): Promise<void> 
 
 // --- Chunked message sending ---
 
-const CHUNK_LEN = MATRIX_MAX_LEN - 1000;
+// Synapse rejects events over 65536 bytes, and the event carries the markdown
+// body and its rendered HTML side by side. So the budget is bytes, not chars
+// (a CJK char is 3 bytes), and 24 KB of markdown leaves room for the HTML.
+const CHUNK_LEN = 24_000;
+
+const byteLen = (s: string): number => Buffer.byteLength(s);
+
+/** How many leading chars of `s` fit in `budget` bytes, never cutting a surrogate pair. */
+function fitChars(s: string, budget: number): number {
+  let n = Math.min(s.length, budget);
+  while (byteLen(s.slice(0, n)) > budget) n = Math.floor(n * 0.9);
+  if (n > 0 && n < s.length && (s.charCodeAt(n - 1) & 0xfc00) === 0xd800) n--;
+  return n;
+}
 
 function splitMessage(text: string): string[] {
-  if (text.length <= CHUNK_LEN) return [text];
+  if (byteLen(text) <= CHUNK_LEN) return [text];
 
   // Split text into atomic segments: complete code blocks + surrounding text.
   // Code blocks are never broken across chunks.
@@ -586,7 +599,7 @@ function splitMessage(text: string): string[] {
 
   for (const seg of segments) {
     const combined = current + seg;
-    if (combined.length <= CHUNK_LEN) {
+    if (byteLen(combined) <= CHUNK_LEN) {
       current = combined;
       continue;
     }
@@ -594,7 +607,7 @@ function splitMessage(text: string): string[] {
     // Won't fit — flush current chunk, start new one
     if (current) chunks.push(current);
 
-    if (seg.length <= CHUNK_LEN) {
+    if (byteLen(seg) <= CHUNK_LEN) {
       current = seg;
     } else {
       // Oversized segment — detect if it's a code block
@@ -607,11 +620,12 @@ function splitMessage(text: string): string[] {
         const footer = "\n" + fence;
         const closeIdx = seg.lastIndexOf("\n" + fence);
         const body = seg.slice(header.length, closeIdx === -1 ? seg.length : closeIdx);
-        const maxBody = CHUNK_LEN - header.length - footer.length;
+        const maxBody = CHUNK_LEN - byteLen(header) - byteLen(footer);
         let rem = body;
-        while (rem.length > maxBody) {
-          let splitAt = rem.lastIndexOf("\n", maxBody);
-          if (splitAt < maxBody / 2) splitAt = maxBody;
+        while (byteLen(rem) > maxBody) {
+          const fit = fitChars(rem, maxBody);
+          let splitAt = rem.lastIndexOf("\n", fit);
+          if (splitAt < fit / 2) splitAt = fit;
           chunks.push(header + rem.slice(0, splitAt) + footer);
           rem = rem.slice(splitAt + (rem[splitAt] === "\n" ? 1 : 0));
         }
@@ -619,9 +633,10 @@ function splitMessage(text: string): string[] {
       } else {
         // Plain text oversized — split at newlines
         let rem = seg;
-        while (rem.length > CHUNK_LEN) {
-          let splitAt = rem.lastIndexOf("\n", CHUNK_LEN);
-          if (splitAt < CHUNK_LEN / 2) splitAt = CHUNK_LEN;
+        while (byteLen(rem) > CHUNK_LEN) {
+          const fit = fitChars(rem, CHUNK_LEN);
+          let splitAt = rem.lastIndexOf("\n", fit);
+          if (splitAt < fit / 2) splitAt = fit;
           chunks.push(rem.slice(0, splitAt));
           rem = rem.slice(splitAt + (rem[splitAt] === "\n" ? 1 : 0));
         }
@@ -1424,9 +1439,7 @@ async function runTurn(opts: {
 
     // No retry on failure: a send that reached the server and lost its response
     // would post the answer twice. The error notice below says it failed.
-    const botReply = result.text.length <= MATRIX_MAX_LEN
-      ? (replyTo ? await replyTo.reply(result.text) : await room.send(result.text))
-      : await sendChunked(room, result.text, replyTo);
+    const botReply = await sendChunked(room, result.text, replyTo);
 
     entry.lastBotMessageId = botReply.id;
     saveEntry(threadId, entry);
