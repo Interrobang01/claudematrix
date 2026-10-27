@@ -342,6 +342,8 @@ type RunResult = {
   exitCode: number;
   costUsd?: number;
   is_error?: boolean;
+  /** Killed by `!stop`, `!new` or shutdown: whatever it said is not an answer. */
+  stopped?: boolean;
   permissionDenials?: PermissionDenial[];
 };
 
@@ -509,7 +511,7 @@ function runClaudeStreaming(opts: {
       if (isError && resultText && !segments.includes(resultText)) segments.push(resultText);
       const text = joinSegments(segments) || resultText || `(no output)${errHint}`;
       const finalText = segments.length ? segments[segments.length - 1] : text;
-      resolve({ text, finalText, exitCode: code ?? 1, costUsd, is_error: isError, permissionDenials });
+      resolve({ text, finalText, exitCode: code ?? 1, costUsd, is_error: isError, stopped: child.killed, permissionDenials });
     });
   });
 }
@@ -1408,6 +1410,10 @@ async function runTurn(opts: {
       saveEntry(threadId, entry);
       result = await runClaudeStreaming({ ...runOpts, sessionId: entry.sessionId, resume: false });
     }
+
+    // Killed on purpose. The command already said so; posting the partial text
+    // as an answer, or marking a fresh session started, would be wrong.
+    if (result.stopped) return false;
 
     const askDenial = result.permissionDenials?.find((d) => d.tool_name === "AskUserQuestion");
     if (askDenial) {
