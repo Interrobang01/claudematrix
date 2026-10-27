@@ -100,6 +100,8 @@ const stmtPendingPut = db.prepare(
    VALUES (@relayRootId, @toName, @homeRoomId, @homeThreadRootId, @homeThreadId, @sentAt, @deadline)`,
 );
 const stmtPendingClear = db.prepare("DELETE FROM pending WHERE relayRootId = ? AND toName = ?");
+const stmtPendingClaim = db.prepare(
+  "DELETE FROM pending WHERE homeThreadId = ? AND toName = ? AND deadline <= ?");
 const stmtPendingDue = db.prepare("SELECT * FROM pending WHERE deadline <= ? ORDER BY deadline");
 
 db.exec("CREATE TABLE IF NOT EXISTS schedule_runs (key TEXT PRIMARY KEY, lastRun INTEGER NOT NULL)");
@@ -1287,16 +1289,27 @@ function siblingsMcpConfig(token: string): string {
   } } });
 }
 
-/** Wake each sender whose sibling has not answered in time. Once each: the
- *  rows are deleted before the turn runs, whatever the turn then does. */
+/** Wake each sender whose sibling has not answered in time. Once each: a wake
+ *  claims its rows (deletes them) only after it holds the lane, so an answer that
+ *  arrives while it waits cancels it, and a later tick cannot wake the same
+ *  conversation again. Wakes run side by side; one busy lane holds up only itself. */
+const wakesInFlight = new Set<string>();
 async function firePendingDeadlines(): Promise<void> {
   const due = stmtPendingDue.all(Date.now()) as Pending[];
-  const seen = new Set<string>();
   for (const p of due) {
-    stmtPendingClear.run(p.relayRootId, p.toName);
     const key = `${p.homeThreadId}\0${p.toName}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
+    if (wakesInFlight.has(key)) continue;
+    wakesInFlight.add(key);
+    wakeSender(p).catch((err) => console.error("[matrix-cc-bot] deadline wake failed:", (err as Error).message))
+      .finally(() => wakesInFlight.delete(key));
+  }
+}
+
+async function wakeSender(p: Pending): Promise<void> {
+  const release = await acquireTurn(p.homeThreadId);
+  try {
+    // Claim: nothing deleted means the answer got here first.
+    if (stmtPendingClaim.run(p.homeThreadId, p.toName, Date.now()).changes === 0) return;
 
     const agent = getRoomAgent(p.homeRoomId);
     const cwd = agent?.workingDirectory ?? roomConfig.defaults?.workingDirectory ?? DEFAULT_CWD;
@@ -1307,17 +1320,14 @@ async function firePendingDeadlines(): Promise<void> {
 
     if (entry.awaitingAnswer) {
       await room.send(`*${p.toName} has not answered (${mins} min). Not waking this conversation while it waits on a confirmation.*`, { notice: true }).catch(() => {});
-      continue;
+      return;
     }
-    const release = await acquireTurn(p.homeThreadId);
-    try {
-      await runTurn({
-        room, roomId: p.homeRoomId, threadId: p.homeThreadId, entry, agent,
-        prompt: `[gateway] ${p.toName} has not answered your message from ${clock(p.sentAt)} (${mins} min). This is the only reminder.`,
-      });
-    } finally {
-      release();
-    }
+    await runTurn({
+      room, roomId: p.homeRoomId, threadId: p.homeThreadId, entry, agent,
+      prompt: `[gateway] ${p.toName} has not answered your message from ${clock(p.sentAt)} (${mins} min). This is the only reminder.`,
+    });
+  } finally {
+    release();
   }
 }
 
