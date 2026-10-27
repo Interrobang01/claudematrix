@@ -1416,6 +1416,14 @@ async function runTurn(opts: {
       return true;
     }
 
+    // A usage limit, a timeout, an empty run: said as a notice, and the turn
+    // failed, so a scheduled job does not advance its last-run mark.
+    if (result.is_error || result.exitCode !== 0) {
+      const text = `Error: ${result.text}`;
+      await (replyTo ? replyTo.reply(text, { notice: true }) : room.send(text, { notice: true })).catch(() => {});
+      return false;
+    }
+
     // The model declined to speak. In a room where agents hear each other,
     // silence is what ends an exchange gracefully.
     // Judged on the last block: a turn that says "let me check", looks, and then
