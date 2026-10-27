@@ -17,11 +17,6 @@ import path from "node:path";
 import { MatrixClient, SimpleFsStorageProvider } from "matrix-bot-sdk";
 import { marked } from "marked";
 
-// Synapse's default max event size is 65536 bytes for the whole event; the body
-// has to fit inside that with formatted_body beside it. 16k of markdown leaves
-// generous room for the HTML rendering of the same text.
-export const MATRIX_MAX_LEN = 16000;
-
 export type Msg = {
   id: string;
   roomId: string;

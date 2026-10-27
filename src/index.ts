@@ -6,7 +6,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import Database from "better-sqlite3";
 import cron from "node-cron";
 import {
-  MatrixTransport, MATRIX_MAX_LEN,
+  MatrixTransport,
   type Msg, type Room, type IncomingMessage,
 } from "./matrix.js";
 
@@ -342,6 +342,8 @@ type RunResult = {
   exitCode: number;
   costUsd?: number;
   is_error?: boolean;
+  /** Killed by `!stop`, `!new` or shutdown: whatever it said is not an answer. */
+  stopped?: boolean;
   permissionDenials?: PermissionDenial[];
 };
 
@@ -371,7 +373,7 @@ function runClaudeStreaming(opts: {
 }): Promise<RunResult> {
   return new Promise((resolve, reject) => {
     const args = [
-      "-p", opts.prompt,
+      "-p",
       ...(opts.resume ? ["--resume", opts.sessionId] : ["--session-id", opts.sessionId]),
       ...(opts.persist === false ? ["--no-session-persistence"] : []),
       "--model", opts.model,
@@ -386,11 +388,15 @@ function runClaudeStreaming(opts: {
         ? [opts.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", opts.systemPrompt]
         : []),
       // Variadic: every bare word after it is taken as another rule. Safe here
-      // because the prompt is passed with -p up front, never positionally. A rule
-      // matching no known tool only warns, so a typo silently grants what it meant
-      // to withhold — check the log after changing this.
+      // because the prompt is last, after `--`. A rule matching no known tool
+      // only warns, so a typo silently grants what it meant to withhold — check
+      // the log after changing this.
       ...(opts.disallowedTools?.length ? ["--disallowed-tools", ...opts.disallowedTools] : []),
       ...(opts.mcpConfigs?.length ? ["--mcp-config", ...opts.mcpConfigs] : []),
+      // `-p` is a bare boolean; the prompt is positional. After `--` so a prompt
+      // that starts with `-` is not parsed as an option.
+      "--",
+      opts.prompt,
     ];
 
     const child = spawn(opts.claudeBin, args, {
@@ -505,7 +511,7 @@ function runClaudeStreaming(opts: {
       if (isError && resultText && !segments.includes(resultText)) segments.push(resultText);
       const text = joinSegments(segments) || resultText || `(no output)${errHint}`;
       const finalText = segments.length ? segments[segments.length - 1] : text;
-      resolve({ text, finalText, exitCode: code ?? 1, costUsd, is_error: isError, permissionDenials });
+      resolve({ text, finalText, exitCode: code ?? 1, costUsd, is_error: isError, stopped: child.killed, permissionDenials });
     });
   });
 }
@@ -554,10 +560,23 @@ async function downloadAttachment(url: string, filepath: string): Promise<void> 
 
 // --- Chunked message sending ---
 
-const CHUNK_LEN = MATRIX_MAX_LEN - 1000;
+// Synapse rejects events over 65536 bytes, and the event carries the markdown
+// body and its rendered HTML side by side. So the budget is bytes, not chars
+// (a CJK char is 3 bytes), and 24 KB of markdown leaves room for the HTML.
+const CHUNK_LEN = 24_000;
+
+const byteLen = (s: string): number => Buffer.byteLength(s);
+
+/** How many leading chars of `s` fit in `budget` bytes, never cutting a surrogate pair. */
+function fitChars(s: string, budget: number): number {
+  let n = Math.min(s.length, budget);
+  while (byteLen(s.slice(0, n)) > budget) n = Math.floor(n * 0.9);
+  if (n > 0 && n < s.length && (s.charCodeAt(n - 1) & 0xfc00) === 0xd800) n--;
+  return n;
+}
 
 function splitMessage(text: string): string[] {
-  if (text.length <= CHUNK_LEN) return [text];
+  if (byteLen(text) <= CHUNK_LEN) return [text];
 
   // Split text into atomic segments: complete code blocks + surrounding text.
   // Code blocks are never broken across chunks.
@@ -582,7 +601,7 @@ function splitMessage(text: string): string[] {
 
   for (const seg of segments) {
     const combined = current + seg;
-    if (combined.length <= CHUNK_LEN) {
+    if (byteLen(combined) <= CHUNK_LEN) {
       current = combined;
       continue;
     }
@@ -590,7 +609,7 @@ function splitMessage(text: string): string[] {
     // Won't fit — flush current chunk, start new one
     if (current) chunks.push(current);
 
-    if (seg.length <= CHUNK_LEN) {
+    if (byteLen(seg) <= CHUNK_LEN) {
       current = seg;
     } else {
       // Oversized segment — detect if it's a code block
@@ -603,11 +622,12 @@ function splitMessage(text: string): string[] {
         const footer = "\n" + fence;
         const closeIdx = seg.lastIndexOf("\n" + fence);
         const body = seg.slice(header.length, closeIdx === -1 ? seg.length : closeIdx);
-        const maxBody = CHUNK_LEN - header.length - footer.length;
+        const maxBody = CHUNK_LEN - byteLen(header) - byteLen(footer);
         let rem = body;
-        while (rem.length > maxBody) {
-          let splitAt = rem.lastIndexOf("\n", maxBody);
-          if (splitAt < maxBody / 2) splitAt = maxBody;
+        while (byteLen(rem) > maxBody) {
+          const fit = fitChars(rem, maxBody);
+          let splitAt = rem.lastIndexOf("\n", fit);
+          if (splitAt < fit / 2) splitAt = fit;
           chunks.push(header + rem.slice(0, splitAt) + footer);
           rem = rem.slice(splitAt + (rem[splitAt] === "\n" ? 1 : 0));
         }
@@ -615,9 +635,10 @@ function splitMessage(text: string): string[] {
       } else {
         // Plain text oversized — split at newlines
         let rem = seg;
-        while (rem.length > CHUNK_LEN) {
-          let splitAt = rem.lastIndexOf("\n", CHUNK_LEN);
-          if (splitAt < CHUNK_LEN / 2) splitAt = CHUNK_LEN;
+        while (byteLen(rem) > CHUNK_LEN) {
+          const fit = fitChars(rem, CHUNK_LEN);
+          let splitAt = rem.lastIndexOf("\n", fit);
+          if (splitAt < fit / 2) splitAt = fit;
           chunks.push(rem.slice(0, splitAt));
           rem = rem.slice(splitAt + (rem[splitAt] === "\n" ? 1 : 0));
         }
@@ -1390,6 +1411,10 @@ async function runTurn(opts: {
       result = await runClaudeStreaming({ ...runOpts, sessionId: entry.sessionId, resume: false });
     }
 
+    // Killed on purpose. The command already said so; posting the partial text
+    // as an answer, or marking a fresh session started, would be wrong.
+    if (result.stopped) return false;
+
     const askDenial = result.permissionDenials?.find((d) => d.tool_name === "AskUserQuestion");
     if (askDenial) {
       entry.started = true;
@@ -1397,17 +1422,25 @@ async function runTurn(opts: {
       return true;
     }
 
+    // A usage limit, a timeout, an empty run: said as a notice, and the turn
+    // failed, so a scheduled job does not advance its last-run mark.
+    if (result.is_error || result.exitCode !== 0) {
+      const text = `Error: ${result.text}`;
+      await (replyTo ? replyTo.reply(text, { notice: true }) : room.send(text, { notice: true })).catch(() => {});
+      return false;
+    }
+
     // The model declined to speak. In a room where agents hear each other,
     // silence is what ends an exchange gracefully.
     // Judged on the last block: a turn that says "let me check", looks, and then
     // decides there is nothing to add has decided, and the narration goes too.
-    // The token may open the block or close it: a block that reports and then
-    // ends `NO_RESPONSE` was posted, token and all, while only a leading token
-    // counted. A notice says so rather than nothing: from the room, a deliberate
+    // The token must stand alone on the block's first or last line: a block
+    // that reports and then ends `NO_RESPONSE` is silent, but prose that merely
+    // mentions the token ("set SILENT_TOKEN to NO_RESPONSE") is an answer. A notice says so rather than nothing: from the room, a deliberate
     // silence and a broken gateway looked identical. Notices are dropped on the
     // way in, so this wakes nobody.
-    const last = result.finalText.trim();
-    if (last.startsWith(SILENT_TOKEN) || last.endsWith(SILENT_TOKEN)) {
+    const lines = result.finalText.trim().split("\n");
+    if (lines[0].trim() === SILENT_TOKEN || lines[lines.length - 1].trim() === SILENT_TOKEN) {
       const notice = `🤐 *${selfName}: no response*`;
       await (replyTo ? replyTo.reply(notice, { notice: true }) : room.send(notice, { notice: true })).catch(() => {});
       entry.started = true;
@@ -1420,9 +1453,7 @@ async function runTurn(opts: {
 
     // No retry on failure: a send that reached the server and lost its response
     // would post the answer twice. The error notice below says it failed.
-    const botReply = result.text.length <= MATRIX_MAX_LEN
-      ? (replyTo ? await replyTo.reply(result.text) : await room.send(result.text))
-      : await sendChunked(room, result.text, replyTo);
+    const botReply = await sendChunked(room, result.text, replyTo);
 
     entry.lastBotMessageId = botReply.id;
     saveEntry(threadId, entry);
