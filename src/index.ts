@@ -1142,7 +1142,7 @@ function startScheduledJobs(): void {
 
         // Cron takes the same lane as a message: `running` only fills once a child
         // has spawned, so checking it alone races a turn that is still starting.
-        const release = await acquireTurn(entry.sessionId);
+        const release = await acquireTurn(threadId);
         try {
           // The thread exists before the turn does, so everything the turn posts
           // lands in it and the session is keyed to it from the start.
@@ -1310,7 +1310,7 @@ async function firePendingDeadlines(): Promise<void> {
       await room.send(`*${p.toName} has not answered (${mins} min). Not waking this conversation while it waits on a confirmation.*`, { notice: true }).catch(() => {});
       continue;
     }
-    const release = await acquireTurn(entry.sessionId);
+    const release = await acquireTurn(p.homeThreadId);
     try {
       await runTurn({
         room, roomId: p.homeRoomId, threadId: p.homeThreadId, entry, agent,
@@ -1560,9 +1560,8 @@ transport.onMessage(async (msg) => {
     // cannot be added to it. Say so where the turn will run, or a message
     // queued behind a long tool call looks like one that never arrived.
     // Taken before anything is awaited, so two arrivals keep their order.
-    const lane = lanes.get(entry.sessionId);
-    const busy = lane?.busy ?? false;
-    const turn = acquireTurn(entry.sessionId);
+    const busy = lanes.get(threadId)?.busy ?? false;
+    const turn = acquireTurn(threadId);
     if (busy) {
       await turnRoom.send("*Queued behind a running turn; it will be read when that turn ends.*", { notice: true }).catch(() => {});
     }
