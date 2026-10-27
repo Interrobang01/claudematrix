@@ -9,7 +9,6 @@ import {
   MatrixTransport, MATRIX_MAX_LEN,
   type Msg, type Room, type IncomingMessage,
 } from "./matrix.js";
-import { relayBlocks, addressesUs } from "./relay.js";
 
 // --- ThreadMap (SQLite-backed) ---
 
@@ -318,9 +317,7 @@ async function fetchThreadHistory(
 const running = new Map<string, ChildProcess>();
 
 type StreamCallbacks = {
-  onText?: (fullText: string) => void;
   /** One completed text block, as soon as the CLI emits it. */
-  onSegment?: (text: string) => void;
   onToolUse?: (toolName: string) => void;
 };
 
@@ -445,12 +442,10 @@ function runClaudeStreaming(opts: {
               if (!seenSegments.has(key)) {
                 seenSegments.add(key);
                 segments.push(messageText);
-                opts.callbacks?.onSegment?.(messageText);
               }
             }
             if (messageText && messageText !== lastSeenText) {
               lastSeenText = messageText;
-              opts.callbacks?.onText?.(joinSegments(segments));
             }
           }
 
@@ -542,19 +537,6 @@ async function sendAskPrompt(
   // sibling's words can be relayed in, it cannot.
   entry.awaitingAnswer = Date.now();
   saveEntry(threadId, entry);
-}
-
-// --- Streaming tool-use callback ---
-
-function createToolUseHandler(ps: PreviewState): (toolName: string) => void {
-  return (toolName) => {
-    console.log(`[matrix-cc-bot] tool: ${toolName}`);
-    ps.toolsUsed.push(toolName);
-    if (ps.msg) {
-      const text = (ps.pendingText || "").slice(0, PREVIEW_MAX_LEN);
-      ps.msg.edit(text + buildStatusLine(ps)).catch(() => {});
-    }
-  };
 }
 
 // --- Attachment handling ---
@@ -667,81 +649,6 @@ async function sendChunked(
   return firstMsg!;
 }
 
-// --- Streaming preview throttle ---
-
-const STREAM_THROTTLE_MS = 1500;
-const STREAM_MIN_DELTA = 40;
-const PREVIEW_MAX_LEN = 4000;
-
-type PreviewState = {
-  msg: Msg | null;
-  lastText: string;
-  lastEditTime: number;
-  timer: NodeJS.Timeout | null;
-  pendingText: string;
-  startTime: number;
-  toolsUsed: string[];
-};
-
-function createPreviewState(): PreviewState {
-  return { msg: null, lastText: "", lastEditTime: 0, timer: null, pendingText: "", startTime: Date.now(), toolsUsed: [] };
-}
-
-function formatElapsed(startTime: number): string {
-  const elapsed = Math.round((Date.now() - startTime) / 1000);
-  const mins = Math.floor(elapsed / 60);
-  const secs = elapsed % 60;
-  return mins > 0 ? `${mins}m${secs}s` : `${secs}s`;
-}
-
-function buildStatusLine(ps: PreviewState): string {
-  const time = formatElapsed(ps.startTime);
-  const toolLine = ps.toolsUsed.length > 0
-    ? `🔧 ${ps.toolsUsed.slice(-3).join(" → ")}\n` : "";
-  return `\n\n${toolLine}⏳ *working... (${time})*`;
-}
-
-function flushPreview(ps: PreviewState): void {
-  if (!ps.msg || !ps.pendingText) return;
-  const display = ps.pendingText.slice(0, PREVIEW_MAX_LEN) + buildStatusLine(ps);
-  ps.msg.edit(display).catch(() => {});
-  ps.lastText = ps.pendingText;
-  ps.lastEditTime = Date.now();
-}
-
-function handleStreamText(ps: PreviewState, fullText: string): void {
-  ps.pendingText = fullText;
-
-  const delta = fullText.length - ps.lastText.length;
-  const elapsed = Date.now() - ps.lastEditTime;
-
-  // Not enough new content
-  if (delta < STREAM_MIN_DELTA && ps.lastEditTime > 0) {
-    if (!ps.timer) {
-      ps.timer = setTimeout(() => {
-        ps.timer = null;
-        flushPreview(ps);
-      }, STREAM_THROTTLE_MS);
-    }
-    return;
-  }
-
-  // Too soon since last edit
-  if (elapsed < STREAM_THROTTLE_MS && ps.lastEditTime > 0) {
-    if (!ps.timer) {
-      ps.timer = setTimeout(() => {
-        ps.timer = null;
-        flushPreview(ps);
-      }, STREAM_THROTTLE_MS - elapsed);
-    }
-    return;
-  }
-
-  // Enough content & time — flush immediately
-  if (ps.timer) clearTimeout(ps.timer);
-  flushPreview(ps);
-}
-
 // --- Room config (agent routing) ---
 
 type RoomSchedule = {
@@ -780,7 +687,6 @@ type RoomConfig = {
   requireMention?: boolean;
   /** Extra case-insensitive regexes counted as a mention, so a bare name in plain
    *  text routes the way a real mention does. */
-  mentionPatterns?: string[];
   /** Admit messages from sibling agents. Default false. */
   allowBots?: boolean;
   /** MXIDs that count as human here. Matrix has no bot flag, so this list is the
@@ -794,9 +700,9 @@ type RoomConfig = {
    *  room a worse piece of evidence than it was, and this list the ground truth
    *  it was standing in for. */
   humans?: string[];
-  /** Where a `<name>` block addressed to somebody who is not in this room is
-   *  forwarded: the room this agent shares with its siblings. Absent, a block
-   *  is local addressing only and nothing leaves the room.
+  /** Where the `message` tool posts when the addressee is not in this room:
+   *  the room this agent shares with its siblings. Absent, the tool works only
+   *  in a room the sibling is already in.
    *
    *  This is not a boundary and is not trying to be one — the agent is root in
    *  its own container and can rewrite this file. What it cannot do is join a
@@ -850,16 +756,13 @@ type RoomConfigFile = {
   configuredRoomsOnly?: boolean;
 };
 
-// `room-config.json` is the name; `channel-config.json` is what every existing
-// deployment has on disk, and the file is gitignored so nothing in the repo can
-// rename it for them. Both are watched and whichever exists is loaded — the
-// startup line says which, because a config that silently did not load has
-// looked exactly like one that did more than once in this project's history.
-const CONFIG_PATHS = ["room-config.json", "channel-config.json"]
-  .map((f) => path.join(import.meta.dirname, "..", f));
+// The startup line says whether it loaded, because a config that silently did
+// not load has looked exactly like one that did more than once in this
+// project's history.
+const CONFIG_PATH = path.join(import.meta.dirname, "..", "room-config.json");
 
 function configPath(): string | null {
-  return CONFIG_PATHS.find((f) => fs.existsSync(f)) ?? null;
+  return fs.existsSync(CONFIG_PATH) ? CONFIG_PATH : null;
 }
 
 function loadRoomConfig(): RoomConfigFile {
@@ -944,11 +847,10 @@ preloadContextFiles();
 warnOnBadSessionIds();
 
 // Watch for config changes and reload
-for (const f of CONFIG_PATHS) fs.watchFile(f, { interval: 5000 }, (curr) => {
-  // A watched file that does not exist reports once anyway, with zeroed stats;
-  // the old `channel-config.json` name did that at every startup.
+fs.watchFile(CONFIG_PATH, { interval: 5000 }, (curr) => {
+  // A watched file that does not exist reports once anyway, with zeroed stats.
   if (curr.mtimeMs === 0) return;
-  console.log(`[matrix-cc-bot] reloading ${path.basename(f)}`);
+  console.log(`[matrix-cc-bot] reloading ${path.basename(CONFIG_PATH)}`);
   roomConfig = loadRoomConfig();
   preloadContextFiles();
   warnOnBadSessionIds();
@@ -983,22 +885,6 @@ function resolveSystemPromptMode(agent: RoomConfig | null): SystemPromptMode {
   return agent?.systemPromptMode ?? roomConfig.defaults?.systemPromptMode ?? "append";
 }
 
-// Opt-in regexes over the message text, for a deployment that wants a typed
-// name to count as a mention. None is set by default: a name in prose woke an
-// agent whenever somebody merely talked about it (removed in 1.1.4). Agents
-// reach each other with the `message` tool, which sets `m.mentions`.
-function matchesMentionPatterns(content: string, agent: RoomConfig | null): boolean {
-  const patterns = agent?.mentionPatterns;
-  if (!patterns?.length) return false;
-  return patterns.some((pattern) => {
-    try {
-      return new RegExp(pattern, "i").test(content);
-    } catch (err) {
-      console.error(`[matrix-cc-bot] bad mentionPattern ${JSON.stringify(pattern)}:`, (err as Error).message);
-      return false;
-    }
-  });
-}
 
 // --- Runaway exchanges ---
 //
@@ -1025,23 +911,19 @@ const HOPS_NOISY = 12;
 // A message arriving mid-turn queues instead of being rejected: with several
 // speakers in one room, mid-turn arrival is the normal case rather than the
 // exception.
-const MAX_QUEUE_DEPTH = 4;
 
 type Lane = { busy: boolean; waiting: (() => void)[] };
 const lanes = new Map<string, Lane>();
 
-/** Returns a release function, or null if this key's queue is already full. */
-function acquireTurn(key: string): Promise<(() => void) | null> {
+/** Resolves with a release function once this key's earlier turns are done.
+ *  The queue has no limit: dropping a message loses it, waiting only delays it. */
+function acquireTurn(key: string): Promise<() => void> {
   let lane = lanes.get(key);
   if (!lane) {
     lane = { busy: false, waiting: [] };
     lanes.set(key, lane);
   }
   const held = lane;
-
-  if (held.busy && held.waiting.length >= MAX_QUEUE_DEPTH) {
-    return Promise.resolve(null);
-  }
 
   const makeRelease = (): (() => void) => {
     let released = false;
@@ -1092,7 +974,7 @@ if (!ACCESS_TOKEN) {
 const threadMap = loadMap();
 const transport = new MatrixTransport(HOMESERVER_URL, ACCESS_TOKEN, STORAGE_PATH);
 
-// This agent's own name, as siblings write it in a `<name>` block: the
+// This agent's own name, as siblings address it with the `message` tool: the
 // localpart of its MXID. Filled in at startup, before any message is handled.
 let selfName = "";
 
@@ -1261,10 +1143,6 @@ function startScheduledJobs(): void {
         // Cron takes the same lane as a message: `running` only fills once a child
         // has spawned, so checking it alone races a turn that is still starting.
         const release = await acquireTurn(entry.sessionId);
-        if (!release) {
-          console.log(`[matrix-cc-bot] cron: ${jobName} session busy, skipping this firing`);
-          return;
-        }
         try {
           // The thread exists before the turn does, so everything the turn posts
           // lands in it and the session is keyed to it from the start.
@@ -1300,62 +1178,6 @@ function startScheduledJobs(): void {
     }
   }
   if (scheduledTasks.length) console.log(`[matrix-cc-bot] started ${scheduledTasks.length} scheduled job(s)`);
-}
-
-/** Forward every `<name>` block in a turn's output to the room this agent
- *  shares with its siblings, and remember where each one came from.
- *
- *  Only the block travels, never the whole message. A turn is written for a
- *  human and will be full of context meant for them; what crosses into a room another
- *  agent can read is exactly the text the agent wrapped and nothing else. That
- *  is the difference between a tag and a bare @mention, and it is the reason
- *  for the tag.
- *
- *  In the shared room itself there is nothing to forward — both parties are
- *  already there, and the tag is only a wake signal. */
-async function forwardRelayBlocks(
-  text: string,
-  ctx: { roomId: string; threadId: string; agent: RoomConfig | null },
-): Promise<void> {
-  const relayRoomId = ctx.agent?.relayRoom;
-  if (!relayRoomId || relayRoomId === ctx.roomId) return;
-
-  // `thread:<root>` is the only session key that names an event, and a relayed
-  // answer has to come back to the thread it was asked from, not to the room.
-  const homeThreadRootId = ctx.threadId.startsWith("thread:") ? ctx.threadId.slice(7) : null;
-
-  for (const block of relayBlocks(text, selfName)) {
-    try {
-      // Posted verbatim, tag included: it is what wakes the addressee on the
-      // other side, and it is what tells a reader of the shared room who the
-      // message is for.
-      const tagged = `<${block.to}>${block.body}</${block.to}>`;
-
-      // One conversation here is one thread there. A second block from the same
-      // home thread joins the shared-room thread the first one opened, so the
-      // sibling answers in the session it already has instead of starting cold.
-      const existing = stmtBridgeByHome.get(ctx.threadId) as Bridge | undefined;
-      if (existing) {
-        await transport.room(relayRoomId, existing.relayRootId).send(tagged);
-        console.log(`[matrix-cc-bot] relayed to ${block.to} → ${relayRoomId} thread ${existing.relayRootId.slice(0, 8)}… (home ${ctx.threadId})`);
-        continue;
-      }
-
-      const root = await transport.room(relayRoomId).send(tagged);
-      stmtBridgePut.run({
-        relayRootId: root.id,
-        homeRoomId: ctx.roomId,
-        homeThreadRootId,
-        homeThreadId: ctx.threadId,
-        addressee: block.to,
-        hops: 0,
-        createdAt: Date.now(),
-      });
-      console.log(`[matrix-cc-bot] relayed to ${block.to} → ${relayRoomId} ${root.id.slice(0, 8)}… (home ${ctx.threadId})`);
-    } catch (err) {
-      console.error(`[matrix-cc-bot] relay to ${block.to} failed:`, (err as Error).message);
-    }
-  }
 }
 
 // --- The `message` tool ---
@@ -1404,7 +1226,7 @@ async function sendToSibling(ctx: TurnCtx, to: string, text: string, expectReply
     const m = await transport.room(sharedRoomId, threadRoot).send(posted, opts);
     relayRootId = threadRoot ?? m.id;
   } else {
-    // One conversation here is one thread there, as for tagged blocks.
+    // One conversation here is one thread there.
     const existing = stmtBridgeByHome.get(ctx.threadId) as Bridge | undefined;
     if (existing) {
       await transport.room(sharedRoomId, existing.relayRootId).send(posted, opts);
@@ -1489,7 +1311,6 @@ async function firePendingDeadlines(): Promise<void> {
       continue;
     }
     const release = await acquireTurn(entry.sessionId);
-    if (!release) continue;
     try {
       await runTurn({
         room, roomId: p.homeRoomId, threadId: p.homeThreadId, entry, agent,
@@ -1518,23 +1339,19 @@ async function runTurn(opts: {
 }): Promise<boolean> {
   const { room, roomId, threadId, entry, agent, prompt, replyTo } = opts;
 
-  const previewState = createPreviewState();
-  previewState.msg = replyTo
-    ? await replyTo.reply("⏳ *Thinking...*", { notice: true })
-    : await room.send("⏳ *Thinking...*", { notice: true });
+  // The typing indicator is the only sign a turn is running. A placeholder
+  // that streamed the turn and was redacted at the end left a "message deleted"
+  // per turn, and its edits, which a redaction does not touch, showed up in some
+  // clients as a second copy of the answer. Typing expires after 30s, so it is
+  // renewed until the turn ends.
   await transport.setTyping(roomId, true);
+  const typing = setInterval(() => { transport.setTyping(roomId, true); }, 20_000);
 
   const baseSystemPrompt = agent?.systemPrompt ?? roomConfig.defaults?.systemPrompt ?? SYSTEM_PROMPT;
   const roomContext = agent ? getContextForRoom(agent) : "";
   const systemPrompt = roomContext
     ? `Room context:\n${roomContext}\n\n${baseSystemPrompt}`
     : baseSystemPrompt;
-
-  // `<name>` blocks are forwarded as each text block completes, not when the
-  // process exits. A turn that starts a background task keeps the CLI alive
-  // until the task finishes, so a ping written before a `sleep 60` used to
-  // reach the sibling a minute late. Chained to keep the blocks in order.
-  let relayed: Promise<void> = Promise.resolve();
 
   // The `message` tool, wherever this conversation can reach a sibling.
   const turnToken = crypto.randomUUID();
@@ -1557,11 +1374,7 @@ async function runTurn(opts: {
     mcpConfigs,
     persist: opts.persist,
     callbacks: {
-      onText: (fullText: string) => handleStreamText(previewState, fullText),
-      onSegment: (text: string) => {
-        relayed = relayed.then(() => forwardRelayBlocks(text, { roomId, threadId, agent }));
-      },
-      onToolUse: createToolUseHandler(previewState),
+      onToolUse: (toolName: string) => console.log(`[matrix-cc-bot] tool: ${toolName}`),
     },
   };
 
@@ -1577,11 +1390,8 @@ async function runTurn(opts: {
       result = await runClaudeStreaming({ ...runOpts, sessionId: entry.sessionId, resume: false });
     }
 
-    if (previewState.timer) clearTimeout(previewState.timer);
-
     const askDenial = result.permissionDenials?.find((d) => d.tool_name === "AskUserQuestion");
     if (askDenial) {
-      await previewState.msg!.delete().catch(() => {});
       entry.started = true;
       await sendAskPrompt(room, threadId, entry, askDenial);
       return true;
@@ -1591,11 +1401,15 @@ async function runTurn(opts: {
     // silence is what ends an exchange gracefully.
     // Judged on the last block: a turn that says "let me check", looks, and then
     // decides there is nothing to add has decided, and the narration goes too.
-    // The placeholder becomes a notice saying so rather than vanishing: from the
-    // room, a deliberate silence and a broken gateway looked identical. Notices
-    // are dropped on the way in, so this wakes nobody.
-    if (result.finalText.trim().startsWith(SILENT_TOKEN)) {
-      await previewState.msg!.edit(`🤐 *${selfName}: no response*`, { notice: true }).catch(() => {});
+    // The token may open the block or close it: a block that reports and then
+    // ends `NO_RESPONSE` was posted, token and all, while only a leading token
+    // counted. A notice says so rather than nothing: from the room, a deliberate
+    // silence and a broken gateway looked identical. Notices are dropped on the
+    // way in, so this wakes nobody.
+    const last = result.finalText.trim();
+    if (last.startsWith(SILENT_TOKEN) || last.endsWith(SILENT_TOKEN)) {
+      const notice = `🤐 *${selfName}: no response*`;
+      await (replyTo ? replyTo.reply(notice, { notice: true }) : room.send(notice, { notice: true })).catch(() => {});
       entry.started = true;
       saveEntry(threadId, entry);
       console.log(`[matrix-cc-bot] ${SILENT_TOKEN} in ${threadId} — nothing posted`);
@@ -1604,31 +1418,22 @@ async function runTurn(opts: {
 
     entry.started = true;
 
-    let botReply: Msg;
-    try {
-      await previewState.msg!.delete().catch(() => {});
-      if (result.text.length <= MATRIX_MAX_LEN) {
-        botReply = replyTo ? await replyTo.reply(result.text) : await room.send(result.text);
-      } else {
-        botReply = await sendChunked(room, result.text, replyTo);
-      }
-    } catch (replyErr) {
-      console.error("[matrix-cc-bot] reply failed, trying fallback:", (replyErr as Error).message);
-      botReply = await room.send(result.text.slice(0, MATRIX_MAX_LEN));
-    }
+    // No retry on failure: a send that reached the server and lost its response
+    // would post the answer twice. The error notice below says it failed.
+    const botReply = result.text.length <= MATRIX_MAX_LEN
+      ? (replyTo ? await replyTo.reply(result.text) : await room.send(result.text))
+      : await sendChunked(room, result.text, replyTo);
 
     entry.lastBotMessageId = botReply.id;
     saveEntry(threadId, entry);
 
     return true;
   } catch (err) {
-    if (previewState.timer) clearTimeout(previewState.timer);
-    if (previewState.msg) await previewState.msg.edit(`Error: ${(err as Error).message}`).catch(() => {});
-    else await room.send(`Error: ${(err as Error).message}`, { notice: true }).catch(() => {});
+    await room.send(`Error: ${(err as Error).message}`, { notice: true }).catch(() => {});
     return false;
   } finally {
+    clearInterval(typing);
     turnTokens.delete(turnToken);
-    await relayed;
     await transport.setTyping(roomId, false);
     for (const p of opts.filePaths ?? []) fs.unlink(p, () => {});
   }
@@ -1652,17 +1457,14 @@ transport.onMessage(async (msg) => {
     const fromBot = !msg.isHuman;
     if (fromBot && !(agent?.allowBots ?? false)) return;
 
-    // A `<name>` block addressed to us is a mention, and in a shared room it is
-    // the one siblings actually use: a bot posting plain `@name` produces no
-    // ping, and a tag is unambiguous where a name in prose is not.
-    const isMentioned = msg.mentionsUs
-      || matchesMentionPatterns(msg.content, agent)
-      || addressesUs(msg.content, selfName);
+    // A mention is `m.mentions` or a pill, which is what the `message` tool
+    // sets. A name in prose is not one, and neither is a `<name>` tag since 1.8.0.
+    const isMentioned = msg.mentionsUs;
 
-    // An answer to a block this agent relayed must carry our tag like any other
-    // message. 1.1.0 routed a sibling's untagged message home too, but a bridge
-    // row lives as long as its thread, so once a human joined the thread the
-    // sibling's answers *to them* went home as well. Untagged is now not for us.
+    // An answer to a message this agent sent must mention us like any other.
+    // 1.1.0 routed a sibling's unaddressed message home too, but a bridge row
+    // lives as long as its thread, so once a human joined the thread the
+    // sibling's answers *to them* went home as well.
     if (agent) {
       if ((agent.requireMention ?? false) && !isMentioned) return;
     } else if (isMentioned) {
@@ -1760,18 +1562,11 @@ transport.onMessage(async (msg) => {
     // Taken before anything is awaited, so two arrivals keep their order.
     const lane = lanes.get(entry.sessionId);
     const busy = lane?.busy ?? false;
-    const full = busy && lane!.waiting.length >= MAX_QUEUE_DEPTH;
     const turn = acquireTurn(entry.sessionId);
     if (busy) {
-      await turnRoom.send(full
-        ? "*Dropped: too many messages already waiting on a running turn.*"
-        : "*Queued behind a running turn; it will be read when that turn ends.*", { notice: true }).catch(() => {});
+      await turnRoom.send("*Queued behind a running turn; it will be read when that turn ends.*", { notice: true }).catch(() => {});
     }
     releaseTurn = await turn;
-    if (!releaseTurn) {
-      console.log(`[matrix-cc-bot] queue full for ${entry.sessionId} — dropping message ${msg.id}`);
-      return;
-    }
 
     // mxc:// is authenticated media, so this goes through the client rather
     // than a bare fetch.
@@ -1798,7 +1593,7 @@ transport.onMessage(async (msg) => {
     // Once several speakers share a room the model has no other way to tell who
     // is talking, and who is talking is the whole of the routing. Only a human's
     // word is a human's, and this label is how that stays checkable.
-    // Who spoke is `[Name]`; who a message is *for* is the `<name>` tag, and the
+    // Who spoke is `[Name]`; who a message is *for* is the mention, and the
     // two are never merged. A relayed answer is labelled even though the room it
     // lands in admits no bots, because it is exactly there that the label is
     // load-bearing: it is the only thing separating a sibling's words from

@@ -2,7 +2,7 @@
 
 A Matrix bot that gives each room its own [Claude Code](https://docs.anthropic.com/en/docs/claude-code) session, and lets agents in different rooms address each other. Two TypeScript files and a transport, minimal dependencies.
 
-A Node process holds one `/sync` connection and spawns **one `claude -p` per message** in that room's working directory, streaming a live preview while the turn runs and posting every text block of the turn verbatim, in order, as one message — including what the model said between tool calls, which the CLI's own `result` field drops. There is no reply tool and no persistent interactive session: what the model writes is what the room sees.
+A Node process holds one `/sync` connection and spawns **one `claude -p` per message** in that room's working directory, showing a typing indicator while the turn runs and posting every text block of the turn verbatim, in order, as one message — including what the model said between tool calls, which the CLI's own `result` field drops. There is no reply tool and no persistent interactive session: what the model writes is what the room sees.
 
 Originally [ecmulli/claudecord](https://github.com/ecmulli/claudecord), a Discord bot, which is where the `channel` vocabulary in older configs comes from.
 
@@ -62,10 +62,6 @@ Who *wrote* a message is the label the gateway puts on it; who it is *for* is th
 
 A recipient is not sandboxed. It reads everything in the room it is in, as any Matrix member does, and threads are not an access-control boundary — they are a relation on events. The scoping is that **only the tool's `text` crosses**, not that the recipient is confined.
 
-### `<name>` tags (deprecated)
-
-Before 1.4.0 agents addressed each other by writing `<alice>…</alice>` in their output, and the gateway forwarded the block. It still works for one more release, so a session that learned it does not go silent; prompts no longer mention it. The tool replaced it because a tag is something an agent can believe it wrote without writing it, and a tool call is in the transcript or it is not.
-
 ## Environment variables
 
 | Variable | Required | Description |
@@ -79,7 +75,7 @@ Before 1.4.0 agents addressed each other by writing `<alice>…</alice>` in thei
 
 ## Room config
 
-`room-config.json`, hot-reloaded on save, gitignored. `channel-config.json` is still read if that is what is on disk, and `channels` / `configuredChannelsOnly` still load as key names; the startup line says which file was used.
+`room-config.json`, hot-reloaded on save, gitignored. `channels` / `configuredChannelsOnly` still load as key names; the startup line says whether the file loaded.
 
 | Key | What |
 |---|---|
@@ -89,7 +85,7 @@ Before 1.4.0 agents addressed each other by writing `<alice>…</alice>` in thei
 | `model` | Passed to `--model`. Overwrites the session's model every turn, so `!model` does not stick in a configured room. |
 | `systemPrompt` / `systemPromptMode` | Appended to Claude Code's own prompt. `"replace"` replaces it, including its tool-use guidance. |
 | `replyInThread` | Open a thread on every top-level message here, giving each exchange its own session. |
-| `requireMention` / `mentionPatterns` | Answer only when addressed: `m.mentions` (which the `message` tool sets) or a pill. The agent's name in plain text does not count. |
+| `requireMention` | Answer only when addressed: `m.mentions` (which the `message` tool sets) or a pill. The agent's name in plain text does not count. |
 | `allowBots` | Admit messages from senders not on the `humans` list, labelled `[name — an agent, not a human]`. Also gives the room the `message` tool. |
 | `humans` | MXIDs that count as human here. Falls back to `defaultHumans`; absent both, everyone is human. |
 | `relayRoom` | The shared room the `message` tool posts into from here. |

@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.8.0 - 2026-10-27
+
+### Removed
+- **The streaming placeholder.** Each turn posted `⏳ Thinking...`, edited the
+  turn into it as it ran, then redacted it and posted the answer. That left a
+  "message deleted" in the room for every turn, and because redacting an event
+  does not redact its edits, some clients (Sable) showed the last edit, the
+  whole answer plus a `⏳ working...` line, as a second copy of the reply.
+  A running turn now shows only the typing indicator, renewed every 20s, and
+  the gateway posts nothing it later deletes. Tool calls are still logged.
+- **`<name>` tags.** Deprecated in 1.4.0 for the `message` tool and unused
+  since; `src/relay.ts` is gone, and a tag is no longer a mention.
+- **`mentionPatterns`** and the **`channel-config.json`** fallback name. No
+  deployment used either.
+- **The queue limit.** A fifth message waiting on a running turn was dropped;
+  now every message waits its turn.
+
+### Fixed
+- **`NO_RESPONSE` at the end of a block was posted.** Only a block that opened
+  with the token counted as silent, so a turn that reported and then closed
+  with `NO_RESPONSE` posted the report with the token in it. The token now
+  counts at either end of the last block.
+- **A failed reply could be posted twice.** When sending the answer threw,
+  the gateway sent it again, so a send that reached the server and lost its
+  response posted a duplicate. There is no retry now; the error notice says
+  the send failed.
+
 ## 1.7.0 - 2026-10-22
 
 ### Added

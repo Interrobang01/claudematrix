@@ -16,7 +16,6 @@ import fs from "node:fs";
 import path from "node:path";
 import { MatrixClient, SimpleFsStorageProvider } from "matrix-bot-sdk";
 import { marked } from "marked";
-import { markRelayTags } from "./relay.js";
 
 // Synapse's default max event size is 65536 bytes for the whole event; the body
 // has to fit inside that with formatted_body beside it. 16k of markdown leaves
@@ -87,10 +86,7 @@ function threadRelation(rootId: string, replyTo?: string): Record<string, any> {
 // here, which is why no prompt needs a "never use markdown tables" line.
 export function renderHtml(text: string): string {
   try {
-    // A <name> block is an addressing tag, not HTML. Element would sanitize the
-    // tag away and render the block as ordinary prose, so it becomes a labelled
-    // quote before markdown ever sees it.
-    return marked.parse(markRelayTags(text), { async: false, breaks: true, gfm: true }) as string;
+    return marked.parse(text, { async: false, breaks: true, gfm: true }) as string;
   } catch {
     return escapeHtml(text).replace(/\n/g, "<br/>");
   }
@@ -232,7 +228,7 @@ export class MatrixTransport {
     // A pill in formatted_body is an <a href="https://matrix.to/#/@user:server">.
     const fb: string = event.content?.formatted_body ?? "";
     // Not the name in plain text: that woke an agent whenever a sibling merely
-    // talked about it. Agents address each other with a `<name>` tag instead.
+    // talked about it. Agents address each other with the `message` tool, which sets `m.mentions`.
     return fb.includes(`/#/${this.userId}`);
   }
 

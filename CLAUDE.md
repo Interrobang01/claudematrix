@@ -17,8 +17,8 @@ own storage, not here.
   touches Matrix.
 - **Sibling messaging:** the `message` tool. `src/mcp-siblings.mjs` is a stdio MCP
   server the CLI starts per turn; it POSTs to the gateway's localhost endpoint,
-  which posts into the shared room and keeps the reply deadline.
-  `src/relay.ts` is the deprecated `<name>` tag, kept one release.
+  which posts into the shared room and keeps the reply deadline. The `<name>`
+  tag it replaced was removed in 1.8.0.
 - **Origin:** a fork of [ecmulli/claudecord](https://github.com/ecmulli/claudecord),
   which is itself fredchu/discord-claude-code-bot plus channel routing. The
   Discord vocabulary in old config files comes from there.
@@ -62,8 +62,12 @@ room message → gating → session key → claude -p --resume <uuid> → messag
   `result` is only the last block, so posting it drops whatever the model said
   before its last tool call. `NO_RESPONSE` is judged on the last block alone.
 - **Anything the gateway says about a turn is `m.notice`.** The transport drops
-  notices on the way in, so a placeholder or status line can never be read
-  as a turn by a sibling sharing the room.
+  notices on the way in, so a status line can never be read as a turn by a
+  sibling sharing the room.
+- **No placeholder, no redactions.** A running turn shows only the typing
+  indicator. Redacting a streamed placeholder left a "message deleted" per
+  turn, and a redaction leaves the original's `m.replace` edits in place, which
+  some clients render as a second copy of the answer.
 - **Only an addressed message is routed home from a bridged thread.** A bridge
   row lives as long as its thread, so "anything from the addressee counts"
   (1.1.0) also caught the addressee answering a human there. Removed in 1.1.2.
@@ -78,7 +82,6 @@ room message → gating → session key → claude -p --resume <uuid> → messag
 src/index.ts              routing, sessions, relay, commands, cron
 src/matrix.ts             transport
 src/mcp-siblings.mjs      the message tool (stdio MCP, per turn)
-src/relay.ts              <name> parsing and rendering (deprecated)
 room-config.json          per-room agents (gitignored, hot-reloaded)
 .env                      homeserver URL, access token, DEFAULT_CWD, CLAUDE_BIN
 threads.db                SQLite (WAL): sessions, the relay bridge, reply deadlines
