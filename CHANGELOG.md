@@ -1,5 +1,47 @@
 # Changelog
 
+## 1.9.0 - 2026-10-27
+
+From an adversarial review of 1.8.0.
+
+### Changed
+- **`allowBots` means "bots may wake me unprompted".** An answer to a message
+  this conversation sent is accepted without it. So an agent can be reachable
+  only by answers: a sibling cannot open a conversation with it, but can reply.
+- **A bot's message is routed home only if it is a real answer:** the sender
+  is someone this conversation messaged in that thread (now recorded for every
+  addressee, in `bridge_to`), it arrived in the conversation's relay room, and
+  it mentions us. Before, any bot posting in a bridged thread with a mention
+  ran a turn in the asker's private session.
+- **When `m.mentions` is present, it alone decides a mention;** pills count only
+  when it is absent, per the spec.
+- **A bad `room-config.json` no longer fails open.** At startup the gateway
+  exits; on reload it keeps the previous config and says so. It used to load
+  an empty config, under which every sender counted as human.
+
+### Fixed
+- **A message starting with `-` was parsed as a CLI option** (a markdown bullet
+  failed the turn; `--settings=…` set a flag). The prompt is now last, after
+  `--`.
+- **Long answers could exceed Synapse's event size** (the limit counted UTF-16
+  characters, not bytes). Chunks are now at most 24 KB of UTF-8.
+- **`NO_RESPONSE` only counts on a line of its own,** first or last, of the
+  last block. 1.8.0's check swallowed "Set SILENT_TOKEN to NO_RESPONSE".
+- **A failed run was posted as an answer** and counted as success, so a
+  scheduled job advanced its last-run mark past transcripts it never read. It
+  is now an `Error:` notice and the turn fails.
+- **A turn killed by `!stop` or `!new` posted its partial output.**
+- **Deadline wakes could fire twice, or after the answer had arrived.** Each
+  wake now claims its row atomically after it gets its lane.
+- **Deadline wakes reset `!model` and `!cd`** to the room's values.
+- **Turns were queued by session ID, which `!new` changes,** so two could run
+  at once on one conversation. Lanes are keyed by conversation.
+- **A sibling's answer was dropped while the conversation awaited a
+  confirmation.** It is kept (`held`) and read by the turn the human's answer
+  starts, and shown in the home thread meanwhile.
+- **A session whose first turn failed** was left unstarted, so the next turn
+  tried to create it again.
+
 ## 1.8.0 - 2026-10-27
 
 ### Removed

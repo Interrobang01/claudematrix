@@ -1448,6 +1448,7 @@ async function runTurn(opts: {
   };
 
   try {
+    let ranId = entry.sessionId;
     let result = await runClaudeStreaming({ ...runOpts, resume: entry.started });
 
     // --resume against a session the CLI has forgotten: reset and retry fresh.
@@ -1456,11 +1457,22 @@ async function runTurn(opts: {
       entry.sessionId = crypto.randomUUID();
       entry.started = false;
       saveEntry(threadId, entry);
+      ranId = entry.sessionId;
       result = await runClaudeStreaming({ ...runOpts, sessionId: entry.sessionId, resume: false });
     }
 
+    // A run that got as far as the CLI may have created the session even if it
+    // then failed or was stopped, and `--session-id` on an existing one is an
+    // error. Marking it started is safe either way: `--resume` on a session
+    // that does not exist takes the "not found" retry above. Unless `!new`
+    // already swapped in a different session, which must stay unstarted.
+    if (entry.sessionId === ranId && !entry.started) {
+      entry.started = true;
+      saveEntry(threadId, entry);
+    }
+
     // Killed on purpose. The command already said so; posting the partial text
-    // as an answer, or marking a fresh session started, would be wrong.
+    // as an answer would be wrong.
     if (result.stopped) return false;
 
     const askDenial = result.permissionDenials?.find((d) => d.tool_name === "AskUserQuestion");
