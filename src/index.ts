@@ -1420,13 +1420,13 @@ async function runTurn(opts: {
     // silence is what ends an exchange gracefully.
     // Judged on the last block: a turn that says "let me check", looks, and then
     // decides there is nothing to add has decided, and the narration goes too.
-    // The token may open the block or close it: a block that reports and then
-    // ends `NO_RESPONSE` was posted, token and all, while only a leading token
-    // counted. A notice says so rather than nothing: from the room, a deliberate
+    // The token must stand alone on the block's first or last line: a block
+    // that reports and then ends `NO_RESPONSE` is silent, but prose that merely
+    // mentions the token ("set SILENT_TOKEN to NO_RESPONSE") is an answer. A notice says so rather than nothing: from the room, a deliberate
     // silence and a broken gateway looked identical. Notices are dropped on the
     // way in, so this wakes nobody.
-    const last = result.finalText.trim();
-    if (last.startsWith(SILENT_TOKEN) || last.endsWith(SILENT_TOKEN)) {
+    const lines = result.finalText.trim().split("\n");
+    if (lines[0].trim() === SILENT_TOKEN || lines[lines.length - 1].trim() === SILENT_TOKEN) {
       const notice = `🤐 *${selfName}: no response*`;
       await (replyTo ? replyTo.reply(notice, { notice: true }) : room.send(notice, { notice: true })).catch(() => {});
       entry.started = true;
