@@ -1301,7 +1301,6 @@ async function firePendingDeadlines(): Promise<void> {
     const agent = getRoomAgent(p.homeRoomId);
     const cwd = agent?.workingDirectory ?? roomConfig.defaults?.workingDirectory ?? DEFAULT_CWD;
     const entry = getOrCreate(threadMap, p.homeThreadId, cwd);
-    if (agent) { entry.cwd = cwd; entry.model = agent.model ?? roomConfig.defaults?.model ?? "opus"; }
     const room = transport.room(p.homeRoomId, p.homeThreadRootId ?? undefined);
     const mins = Math.round((Date.now() - p.sentAt) / 60_000);
     console.log(`[matrix-cc-bot] ${p.toName} did not answer ${p.homeThreadId} in ${mins} min — waking it`);
