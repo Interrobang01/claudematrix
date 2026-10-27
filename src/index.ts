@@ -77,6 +77,17 @@ const stmtBridgePut = db.prepare(
 );
 const stmtBridgeHop = db.prepare("UPDATE bridge SET hops = hops + 1 WHERE relayRootId = ?");
 db.exec("CREATE INDEX IF NOT EXISTS bridge_home ON bridge (homeThreadId)");
+// Everyone this home conversation has messaged in the relay thread. `addressee`
+// holds only the first; later messages from the same thread reuse the relay thread
+// for other agents. Only these senders' answers are routed home.
+db.exec(`CREATE TABLE IF NOT EXISTS bridge_to (
+  relayRootId TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  PRIMARY KEY (relayRootId, name)
+)`);
+db.exec("INSERT OR IGNORE INTO bridge_to (relayRootId, name) SELECT relayRootId, addressee FROM bridge");
+const stmtBridgeToPut = db.prepare("INSERT OR IGNORE INTO bridge_to (relayRootId, name) VALUES (?, ?)");
+const stmtBridgeToGet = db.prepare("SELECT 1 FROM bridge_to WHERE relayRootId = ? AND name = ?");
 const stmtBridgeByHome = db.prepare("SELECT * FROM bridge WHERE homeThreadId = ? ORDER BY createdAt LIMIT 1");
 
 // A message sent with the `message` tool that expects an answer. The sender's
@@ -793,27 +804,45 @@ function configPath(): string | null {
   return fs.existsSync(CONFIG_PATH) ? CONFIG_PATH : null;
 }
 
+/** Throws if the file exists but does not parse or is not shaped like a config.
+ *  Callers decide: startup exits, a reload keeps what it had. Returning an empty
+ *  config here would drop every `humans` list and every tool denial. */
 function loadRoomConfig(): RoomConfigFile {
-  try {
-    const found = configPath();
-    if (found) {
-      const raw = JSON.parse(fs.readFileSync(found, "utf8"));
-      // `channels` and `configuredChannelsOnly` are what the Discord-era config
-      // called these. The file is gitignored, so a deployment's copy can only be
-      // renamed by hand; both spellings load.
-      return {
-        ...raw,
-        rooms: raw.rooms ?? raw.channels ?? {},
-        configuredRoomsOnly: raw.configuredRoomsOnly ?? raw.configuredChannelsOnly ?? false,
-      };
-    }
-  } catch (err) {
-    console.error(`[matrix-cc-bot] failed to load ${configPath() ?? "room-config.json"}:`, err);
-  }
-  return { rooms: {} };
+  const found = configPath();
+  if (!found) return { rooms: {} };
+  const raw = JSON.parse(fs.readFileSync(found, "utf8"));
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("top level is not an object");
+  const rooms = raw.rooms ?? raw.channels ?? {};
+  if (!rooms || typeof rooms !== "object" || Array.isArray(rooms)) throw new Error("`rooms` is not an object");
+  // `channels` and `configuredChannelsOnly` are what the Discord-era config
+  // called these. The file is gitignored, so a deployment's copy can only be
+  // renamed by hand; both spellings load.
+  return {
+    ...raw,
+    rooms,
+    configuredRoomsOnly: raw.configuredRoomsOnly ?? raw.configuredChannelsOnly ?? false,
+  };
 }
 
-let roomConfig = loadRoomConfig();
+/** Reload, keeping the previous config if the new file is bad. */
+function reloadRoomConfig(): boolean {
+  try {
+    roomConfig = loadRoomConfig();
+    return true;
+  } catch (err) {
+    console.error(`[matrix-cc-bot] !!! ${CONFIG_PATH} is invalid — KEEPING THE PREVIOUS CONFIG:`, err);
+    return false;
+  }
+}
+
+let roomConfig: RoomConfigFile;
+try {
+  roomConfig = loadRoomConfig();
+} catch (err) {
+  console.error(`[matrix-cc-bot] ${CONFIG_PATH} exists but cannot be loaded; refusing to start without its humans lists:`, err);
+  process.exit(1);
+}
+
 
 // --- Context File Cache ---
 
@@ -879,7 +908,7 @@ fs.watchFile(CONFIG_PATH, { interval: 5000 }, (curr) => {
   // A watched file that does not exist reports once anyway, with zeroed stats.
   if (curr.mtimeMs === 0) return;
   console.log(`[matrix-cc-bot] reloading ${path.basename(CONFIG_PATH)}`);
-  roomConfig = loadRoomConfig();
+  if (!reloadRoomConfig()) return;
   preloadContextFiles();
   warnOnBadSessionIds();
   // Everything `!reload-config` does. The `humans` lists and the schedules are
@@ -1090,7 +1119,10 @@ async function handleCommand(msg: IncomingMessage, room: Room, threadId: string)
     }
 
     case "!reload-config":
-      roomConfig = loadRoomConfig();
+      if (!reloadRoomConfig()) {
+        await room.send("⚠️ *room-config.json is invalid — kept the previous config. See the log.*");
+        return true;
+      }
       preloadContextFiles();
       warnOnBadSessionIds();
       applyRoomHumans();
@@ -1259,6 +1291,7 @@ async function sendToSibling(ctx: TurnCtx, to: string, text: string, expectReply
     if (existing) {
       await transport.room(sharedRoomId, existing.relayRootId).send(posted, opts);
       relayRootId = existing.relayRootId;
+      stmtBridgeToPut.run(relayRootId, to);
     } else {
       const root = await transport.room(sharedRoomId).send(posted, opts);
       relayRootId = root.id;
@@ -1266,6 +1299,7 @@ async function sendToSibling(ctx: TurnCtx, to: string, text: string, expectReply
         relayRootId, homeRoomId: ctx.roomId, homeThreadRootId: threadRoot ?? null,
         homeThreadId: ctx.threadId, addressee: to, hops: 0, createdAt: Date.now(),
       });
+      stmtBridgeToPut.run(relayRootId, to);
     }
   }
   console.log(`[matrix-cc-bot] message to ${to} → ${sharedRoomId} thread ${relayRootId.slice(0, 8)}… (from ${ctx.threadId}, reply ${expectReply ? "expected" : "not expected"})`);
@@ -1500,11 +1534,22 @@ transport.onMessage(async (msg) => {
 
     // Matrix has no bot flag, so "from a sibling" is "not on the human list".
     const fromBot = !msg.isHuman;
-    if (fromBot && !(agent?.allowBots ?? false)) return;
 
     // A mention is `m.mentions` or a pill, which is what the `message` tool
     // sets. A name in prose is not one, and neither is a `<name>` tag since 1.8.0.
     const isMentioned = msg.mentionsUs;
+
+    // An answer to something this agent relayed: the thread has a bridge row, the
+    // sender is somebody that conversation actually messaged there, it arrived in
+    // that conversation's relay room, and it is addressed to us. Anything else
+    // from a bot is unsolicited, which `allowBots` decides.
+    const inThread = msg.threadRootId;
+    const bridge = inThread ? lookupBridge(inThread) : null;
+    const routed = fromBot && bridge && isMentioned
+      && getRoomAgent(bridge.homeRoomId)?.relayRoom === msg.roomId
+      && !!stmtBridgeToGet.get(bridge.relayRootId, localpart(msg.sender))
+      ? bridge : null;
+    if (fromBot && !routed && !(agent?.allowBots ?? false)) return;
 
     // An answer to a message this agent sent must mention us like any other.
     // 1.1.0 routed a sibling's unaddressed message home too, but a bridge row
@@ -1529,7 +1574,6 @@ transport.onMessage(async (msg) => {
     // Where a notice or a command answer belongs: exactly where it was typed.
     // A command must never *start* a thread — `!new` at the top level is about
     // the room's own session, not about opening a side-conversation.
-    const inThread = msg.threadRootId;
     const room = transport.room(msg.roomId, inThread);
 
     // Commands are free: no turn, no spend.
@@ -1548,14 +1592,12 @@ transport.onMessage(async (msg) => {
     // but it belongs to the conversation that asked for it, so the turn runs in
     // that session and its output goes back to that thread. Everything below
     // this point is the ordinary path with a different room and session.
-    const bridge = inThread ? lookupBridge(inThread) : null;
     if (bridge && !fromBot) {
       // A human speaking in a bridged thread is a human in the shared room, not an
       // answer from a sibling. Routing it home would forge the one distinction
       // the whole arrangement rests on.
       console.log(`[matrix-cc-bot] human message in bridged thread ${inThread!.slice(0, 8)}… — not routed home`);
     }
-    const routed = bridge && fromBot ? bridge : null;
 
     const turnRoomId = routed ? routed.homeRoomId : msg.roomId;
     const turnThreadRoot = routed ? (routed.homeThreadRootId ?? undefined) : outThread;

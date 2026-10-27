@@ -72,6 +72,12 @@ room message → gating → session key → claude -p --resume <uuid> → messag
 - **Only an addressed message is routed home from a bridged thread.** A bridge
   row lives as long as its thread, so "anything from the addressee counts"
   (1.1.0) also caught the addressee answering a human there. Removed in 1.1.2.
+- **Routing home needs a solicited sender.** A bot's message goes into the home
+  session only if it mentions us, arrives in the home agent's `relayRoom`, and
+  the sender is in `bridge_to` (everyone that conversation messaged in that
+  thread; `addressee` is only the first). Otherwise it is unsolicited and
+  `allowBots` decides, so `allowBots: false` means "nobody cold-messages me"
+  while answers still arrive.
 - **Verify behaviour, not the config value.** This codebase has a history of
   keys that were read by nothing (`replyInThread` sat inert in the config for
   months) and of configs that silently failed to load. New config keys need a

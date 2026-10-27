@@ -50,7 +50,7 @@ The gateway posts `text` into the shared room with an `m.mentions` for the recip
 1. You and `bob` are talking in `bob`'s own room, in a thread.
 2. `bob` calls `message("alice", …)`. The text — and only the text — is posted into the shared room, and a row in the `bridge` table remembers which thread it came from. Later messages from the same thread go into the same shared-room thread, so one conversation stays one conversation on both sides.
 3. `alice` wakes in that shared-room thread and answers with `message("bob", …)`. Plain text it writes there is posted for the room and reaches no agent.
-4. `bob`'s gateway recognises the thread, posts `alice`'s answer into the original thread labelled `[alice — an agent, not a human]`, and runs the next turn in **that** session.
+4. `bob`'s gateway recognises the thread — the answer must come from an agent that conversation actually messaged there, in `bob`'s `relayRoom`, and mention `bob` — posts `alice`'s answer into the original thread labelled `[alice — an agent, not a human]`, and runs the next turn in **that** session.
 
 **The tool result is the only acknowledgement.** It says how the sender will be woken: by the answer, or once when `replyTimeoutMinutes` (default 5) passes with none, when the gateway starts a turn in the sender's conversation saying so. The deadline is in SQLite, so it survives a restart. Nothing is asked of the recipient, so there is no chain of acknowledgements. `expect_reply: false` sets no deadline.
 
@@ -75,7 +75,7 @@ A recipient is not sandboxed. It reads everything in the room it is in, as any M
 
 ## Room config
 
-`room-config.json`, hot-reloaded on save, gitignored. `channels` / `configuredChannelsOnly` still load as key names; the startup line says whether the file loaded.
+`room-config.json`, hot-reloaded on save, gitignored. `channels` / `configuredChannelsOnly` still load as key names; a file that exists but does not parse stops startup (exit 1), and on reload keeps the previous config with a loud log line.
 
 | Key | What |
 |---|---|
@@ -85,8 +85,8 @@ A recipient is not sandboxed. It reads everything in the room it is in, as any M
 | `model` | Passed to `--model`. Overwrites the session's model every turn, so `!model` does not stick in a configured room. |
 | `systemPrompt` / `systemPromptMode` | Appended to Claude Code's own prompt. `"replace"` replaces it, including its tool-use guidance. |
 | `replyInThread` | Open a thread on every top-level message here, giving each exchange its own session. |
-| `requireMention` | Answer only when addressed: `m.mentions` (which the `message` tool sets) or a pill. The agent's name in plain text does not count. |
-| `allowBots` | Admit messages from senders not on the `humans` list, labelled `[name — an agent, not a human]`. Also gives the room the `message` tool. |
+| `requireMention` | Answer only when addressed: `m.mentions` (which the `message` tool sets), or a pill when the message has no `m.mentions` at all. The agent's name in plain text does not count. |
+| `allowBots` | Bots may wake this agent unprompted: admit unsolicited messages from senders not on the `humans` list, labelled `[name — an agent, not a human]`. Also gives the room the `message` tool. It is not needed for answers: an addressed answer from an agent this conversation messaged, in its `relayRoom` thread, is routed home regardless. |
 | `humans` | MXIDs that count as human here. Falls back to `defaultHumans`; absent both, everyone is human. |
 | `relayRoom` | The shared room the `message` tool posts into from here. |
 | `replyTimeoutMinutes` | Minutes before a sibling's silence wakes the sender of a `message` that expects an answer. Default 5; also settable under `defaults`. |
