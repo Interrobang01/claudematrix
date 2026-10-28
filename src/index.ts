@@ -284,23 +284,36 @@ const HISTORY_FETCH_LIMIT = 30;
 
 async function fetchThreadHistory(
   roomId: string,
+  threadRootId: string | undefined,
   entry: ThreadEntry,
   botUserId: string,
   currentMessageId?: string,
 ): Promise<string> {
+  // Newest first. In a thread: the thread's own events, then its root, which
+  // the relations endpoint leaves out. At the top level: the room timeline
+  // minus anything threaded, which belongs to a conversation of its own.
   let events: any[];
   try {
-    const res = await transport.client.doRequest(
-      "GET", `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages`,
-      { dir: "b", limit: HISTORY_FETCH_LIMIT },
-    );
-    events = res?.chunk ?? [];
+    if (threadRootId) {
+      const res = await transport.client.doRequest(
+        "GET", `/_matrix/client/v1/rooms/${encodeURIComponent(roomId)}/relations/${encodeURIComponent(threadRootId)}/m.thread`,
+        { dir: "b", limit: HISTORY_FETCH_LIMIT },
+      );
+      const root = await transport.client.getEvent(roomId, threadRootId).catch(() => null);
+      events = [...(res?.chunk ?? []), ...(root ? [root] : [])];
+    } else {
+      const res = await transport.client.doRequest(
+        "GET", `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages`,
+        { dir: "b", limit: HISTORY_FETCH_LIMIT },
+      );
+      events = (res?.chunk ?? []).filter((ev: any) => ev.content?.["m.relates_to"]?.rel_type !== "m.thread");
+    }
   } catch {
     return "";
   }
 
-  // Paginating backwards yields newest first; the model wants oldest first. Stop
-  // at our own last reply, which is where "since your last reply" is anchored.
+  // Stop at our own last reply, which is where "since your last reply" is
+  // anchored. Gateway notices and edits are not conversation.
   const stopAt = entry.started ? entry.lastBotMessageId : undefined;
   const collected: any[] = [];
   for (const ev of events) {
@@ -308,26 +321,27 @@ async function fetchThreadHistory(
     if (ev.type !== "m.room.message") continue;
     if (ev.sender === botUserId) continue;
     if (ev.event_id === currentMessageId) continue;
+    if (ev.content?.msgtype === "m.notice") continue;
     if (ev.content?.["m.relates_to"]?.rel_type === "m.replace") continue;
     collected.push(ev);
   }
   const sorted = collected.reverse();
 
-  if (sorted.length === 0) return "";
-
+  // Labelled like a live message: a sibling's words are marked as an agent's.
   const lines = (await Promise.all(sorted.map(async (m) => {
     const name = await transport.shortName(m.sender);
+    const label = transport.isHumanIn(roomId, m.sender) ? name : `${name} — an agent, not a human`;
     const text = (m.content?.body ?? "").trim();
-    return text ? `[${name}] ${text}` : null;
+    return text ? `[${label}] ${text}` : null;
   }))).filter(Boolean);
 
   if (lines.length === 0) return "";
 
-  const label = entry.started
-    ? "Messages from other users since your last reply"
-    : "Recent thread history for context";
+  const heading = entry.started
+    ? "Messages from others since your last reply"
+    : threadRootId ? "Earlier in this thread" : "Recent room history for context";
 
-  return `[${label}]\n${lines.join("\n")}\n[End]\n\n`;
+  return `[${heading}]\n${lines.join("\n")}\n[End]\n\n`;
 }
 
 // --- Streaming Runner ---
@@ -1692,7 +1706,7 @@ transport.onMessage(async (msg) => {
     }
 
     const history = (!routed && (agent?.fetchHistory ?? true))
-      ? await fetchThreadHistory(msg.roomId, entry, transport.getUserId(), msg.id)
+      ? await fetchThreadHistory(msg.roomId, inThread, entry, transport.getUserId(), msg.id)
       : "";
 
     // Once several speakers share a room the model has no other way to tell who

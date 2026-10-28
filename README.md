@@ -90,7 +90,7 @@ A recipient is not sandboxed. It reads everything in the room it is in, as any M
 | `humans` | MXIDs that count as human here. Falls back to `defaultHumans`; absent both, everyone is human. |
 | `relayRoom` | The shared room the `message` tool posts into from here. |
 | `replyTimeoutMinutes` | Minutes before a sibling's silence wakes the sender of a `message` that expects an answer. Default 5; also settable under `defaults`. |
-| `fetchHistory` | Prepend recent room messages to the prompt. Default true; off is usually what you want in a room with several speakers. |
+| `fetchHistory` | Prepend what others said since this agent last replied (up to 30 messages): the thread's own messages in a thread, unthreaded room messages at the top level. Siblings are labelled as agents; gateway notices are left out. Default true. |
 | `mcpConfig` | Path passed to `--mcp-config`. A claude.ai connector declared there as a `claudeai-proxy` server loads before the first model request instead of racing it. |
 | `disallowedTools` | Passed to `--disallowed-tools`, by name rather than as an allowlist, so a connector authenticated later cannot appear by surprise. |
 | `sessionGroup` | Rooms sharing a group share one session. A thread overrides it. |

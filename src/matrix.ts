@@ -126,6 +126,12 @@ export class MatrixTransport {
     this.humansByRoom.set(roomId, new Set(mxids));
   }
 
+  /** Same rule as an incoming message's `isHuman`. */
+  isHumanIn(roomId: string, mxid: string): boolean {
+    const humans = this.humansByRoom.get(roomId);
+    return humans ? humans.has(mxid) : true;
+  }
+
   async start(): Promise<{ userId: string; displayName: string }> {
     this.userId = await this.client.getUserId();
     try {

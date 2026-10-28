@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.9.1 - 2026-10-27
+
+### Fixed
+- **`fetchHistory` fetched the room, not the thread.** It read the last 30
+  events of the whole room, so a turn in one thread was given every other
+  thread's traffic. In a thread it now reads that thread (plus its root); at
+  the top level, only unthreaded messages. Siblings' lines carry the same
+  "an agent, not a human" label as a live message, and gateway notices are
+  left out.
+
 ## 1.9.0 - 2026-10-27
 
 From an adversarial review of 1.8.0.
