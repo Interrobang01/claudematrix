@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.10.0 - 2026-10-29
+
+### Added
+- **`STATE_DIR`.** Config, database, sync token and attachments resolve against
+  it instead of the checkout, so one (read-only) checkout can run a second
+  account. Unset, nothing changes. An empty `MATRIX_STORAGE` now means the
+  default rather than a file named "".
+
 ## 1.9.1 - 2026-10-27
 
 ### Fixed

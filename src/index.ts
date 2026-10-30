@@ -27,8 +27,13 @@ type ThreadEntry = {
 
 type ThreadMap = Record<string, ThreadEntry>;
 
-const DB_PATH = path.join(import.meta.dirname, "..", "threads.db");
-const JSON_PATH = path.join(import.meta.dirname, "..", "thread-map.json");
+// Where this gateway's state lives: the database, the config, the sync token,
+// attachments. Defaults to the checkout. Set it to run a second account from one
+// checkout, or from a read-only one.
+const STATE_DIR = process.env.STATE_DIR || path.join(import.meta.dirname, "..");
+
+const DB_PATH = path.join(STATE_DIR, "threads.db");
+const JSON_PATH = path.join(STATE_DIR, "thread-map.json");
 
 const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
@@ -579,7 +584,8 @@ async function sendAskPrompt(
 
 // --- Attachment handling ---
 
-const ATTACH_TMP_DIR = path.join(import.meta.dirname, "..", "tmp-attachments");
+const ATTACH_TMP_DIR = path.join(STATE_DIR, "tmp-attachments");
+fs.mkdirSync(ATTACH_TMP_DIR, { recursive: true });
 const ATTACH_MAX_BYTES = 10 * 1024 * 1024; // 10 MB per file
 
 async function downloadAttachment(url: string, filepath: string): Promise<void> {
@@ -812,7 +818,7 @@ type RoomConfigFile = {
 // The startup line says whether it loaded, because a config that silently did
 // not load has looked exactly like one that did more than once in this
 // project's history.
-const CONFIG_PATH = path.join(import.meta.dirname, "..", "room-config.json");
+const CONFIG_PATH = path.join(STATE_DIR, "room-config.json");
 
 function configPath(): string | null {
   return fs.existsSync(CONFIG_PATH) ? CONFIG_PATH : null;
@@ -1035,7 +1041,7 @@ const ACCESS_TOKEN = process.env.MATRIX_ACCESS_TOKEN!;
 const DEFAULT_CWD = process.env.DEFAULT_CWD ?? process.cwd();
 const CLAUDE_BIN = process.env.CLAUDE_BIN ?? "claude";
 const STORAGE_PATH = process.env.MATRIX_STORAGE
-  ?? path.join(import.meta.dirname, "..", "matrix-sync.json");
+  || path.join(STATE_DIR, "matrix-sync.json");
 
 if (!ACCESS_TOKEN) {
   console.error("Missing MATRIX_ACCESS_TOKEN");

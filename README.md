@@ -70,7 +70,8 @@ A recipient is not sandboxed. It reads everything in the room it is in, as any M
 | `MATRIX_ACCESS_TOKEN` | Yes | Access token for the bot's account. |
 | `DEFAULT_CWD` | No | Working directory for rooms with no configured one. |
 | `CLAUDE_BIN` | No | Path to the `claude` binary. Defaults to `claude` on `PATH`. |
-| `MATRIX_STORAGE` | No | Where the `/sync` token is kept. Defaults to `./matrix-sync.json`. |
+| `STATE_DIR` | No | Where `room-config.json`, `threads.db`, the sync token and attachments live. Defaults to the checkout. Two gateways (two accounts) can share one checkout with a `STATE_DIR` each; the `message` tool's port is ephemeral, so they do not collide. |
+| `MATRIX_STORAGE` | No | Where the `/sync` token is kept. Defaults to `matrix-sync.json` in `STATE_DIR`. |
 | `SILENT_TOKEN` | No | The literal a turn emits to post nothing. Defaults to `NO_RESPONSE`. |
 
 ## Room config
