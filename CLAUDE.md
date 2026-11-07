@@ -78,6 +78,9 @@ room message → gating → session key → claude -p --resume <uuid> → messag
   thread; `addressee` is only the first). Otherwise it is unsolicited and
   `allowBots` decides, so `allowBots: false` means "nobody cold-messages me"
   while answers still arrive.
+- **A file event's `body` may be the whole message.** It is a caption when
+  `filename` is set and differs. Attachment files outlive the turn (14 days),
+  because the session that was told their path does.
 - **Verify behaviour, not the config value.** This codebase has a history of
   keys that were read by nothing (`replyInThread` sat inert in the config for
   months) and of configs that silently failed to load. New config keys need a

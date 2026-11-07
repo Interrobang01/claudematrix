@@ -6,7 +6,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import Database from "better-sqlite3";
 import cron from "node-cron";
 import {
-  MatrixTransport,
+  MatrixTransport, attachmentPath,
   type Msg, type Room, type IncomingMessage,
 } from "./matrix.js";
 
@@ -585,8 +585,29 @@ async function sendAskPrompt(
 // --- Attachment handling ---
 
 const ATTACH_TMP_DIR = path.join(STATE_DIR, "tmp-attachments");
-fs.mkdirSync(ATTACH_TMP_DIR, { recursive: true });
+// Not fatal: an agent that cannot take attachments can still answer text, and a
+// dangling state symlink here took three gateways down for two days (1.11.0).
+// If it is still missing at download time, the turn is told the file failed.
+try {
+  fs.mkdirSync(ATTACH_TMP_DIR, { recursive: true });
+} catch (err) {
+  console.error(`[matrix-cc-bot] attachments unavailable: ${(err as Error).message}`);
+}
 const ATTACH_MAX_BYTES = 10 * 1024 * 1024; // 10 MB per file
+// A session is resumed turn after turn and may go back to a file it was given
+// earlier, so a file outlives its turn. Nothing else cleans this directory.
+const ATTACH_KEEP_MS = 14 * 24 * 60 * 60 * 1000;
+
+function pruneAttachments(): void {
+  try {
+    for (const f of fs.readdirSync(ATTACH_TMP_DIR)) {
+      const p = path.join(ATTACH_TMP_DIR, f);
+      if (Date.now() - fs.statSync(p).mtimeMs > ATTACH_KEEP_MS) fs.unlinkSync(p);
+    }
+  } catch (err) {
+    console.error(`[matrix-cc-bot] attachment prune failed: ${(err as Error).message}`);
+  }
+}
 
 async function downloadAttachment(url: string, filepath: string): Promise<void> {
   const res = await fetch(url);
@@ -1423,7 +1444,6 @@ async function runTurn(opts: {
   agent: RoomConfig | null;
   prompt: string;
   replyTo?: Msg;
-  filePaths?: string[];
   persist?: boolean;
 }): Promise<boolean> {
   const { room, roomId, threadId, entry, agent, prompt, replyTo } = opts;
@@ -1546,7 +1566,6 @@ async function runTurn(opts: {
     clearInterval(typing);
     turnTokens.delete(turnToken);
     await transport.setTyping(roomId, false);
-    for (const p of opts.filePaths ?? []) fs.unlink(p, () => {});
   }
 }
 
@@ -1609,7 +1628,7 @@ transport.onMessage(async (msg) => {
     const room = transport.room(msg.roomId, inThread);
 
     // Commands are free: no turn, no spend.
-    if (msg.isHuman && msg.content.trim().startsWith("!")) {
+    if (msg.isHuman && msg.attachments.length === 0 && msg.content.trim().startsWith("!")) {
       if (await handleCommand(msg, room, sessionKey(msg.roomId, agent, inThread))) return;
     }
 
@@ -1695,23 +1714,30 @@ transport.onMessage(async (msg) => {
 
     // mxc:// is authenticated media, so this goes through the client rather
     // than a bare fetch.
-    const filePaths: string[] = [];
+    const attached: string[] = [];
+    const notDelivered: string[] = [];
     for (const att of msg.attachments) {
       if (att.size > ATTACH_MAX_BYTES) {
         console.log(`[matrix-cc-bot] skipping oversized attachment: ${att.name} (${att.size} bytes)`);
+        notDelivered.push(`${att.name} was attached but not delivered: it is over the ${ATTACH_MAX_BYTES / (1024 * 1024)} MB limit.`);
         continue;
       }
-      const ext = att.name.split(".").pop() ?? "bin";
-      const filepath = path.join(ATTACH_TMP_DIR, `${msg.id.replace(/[^\w]/g, "")}.${ext}`);
+      const filepath = attachmentPath(ATTACH_TMP_DIR, msg.id, att.name);
       try {
         await transport.downloadMedia(att.mxc, filepath);
-        filePaths.push(filepath);
+        attached.push(`${filepath} (sent as ${att.name})`);
       } catch (err) {
         console.error(`[matrix-cc-bot] attachment download failed: ${(err as Error).message}`);
+        notDelivered.push(`${att.name} was attached but not delivered: the download failed.`);
       }
     }
+    if (msg.attachments.length > 0) pruneAttachments();
 
-    const history = (!routed && (agent?.fetchHistory ?? true))
+    // A top-level message that opens a thread starts a conversation of its own.
+    // What else sits at the top level of the room is the roots of other threads,
+    // not context for this one.
+    const opensThread = !inThread && !!outThread;
+    const history = (!routed && !opensThread && (agent?.fetchHistory ?? true))
       ? await fetchThreadHistory(msg.roomId, inThread, entry, transport.getUserId(), msg.id)
       : "";
 
@@ -1724,11 +1750,12 @@ transport.onMessage(async (msg) => {
     // load-bearing: it is the only thing separating a sibling's words from
     // the operator's in the room where their word is authority.
     let userMessage = body;
-    if (filePaths.length === 1) {
-      userMessage = `${body}\n\nThe user attached a file: ${filePaths[0]}`.trim();
-    } else if (filePaths.length > 1) {
-      userMessage = `${body}\n\nThe user attached files:\n${filePaths.map((p) => `- ${p}`).join("\n")}`.trim();
+    if (attached.length === 1) {
+      userMessage = `${body}\n\nThe user attached a file: ${attached[0]}`.trim();
+    } else if (attached.length > 1) {
+      userMessage = `${body}\n\nThe user attached files:\n${attached.map((p) => `- ${p}`).join("\n")}`.trim();
     }
+    if (notDelivered.length > 0) userMessage = `${userMessage}\n\n${notDelivered.join("\n")}`.trim();
 
     // A relayed answer is put into the home thread verbatim before the turn
     // runs, so the conversation the operator is reading stays readable: they see what
@@ -1746,7 +1773,6 @@ transport.onMessage(async (msg) => {
       agent: turnAgent,
       prompt: held + (history ? `${history}${userMessage}` : userMessage),
       replyTo: routed ? undefined : transport.msg(msg.roomId, msg.id, outThread),
-      filePaths,
     });
   } catch (err) {
     console.error("[matrix-cc-bot] handler error:", (err as Error).message);

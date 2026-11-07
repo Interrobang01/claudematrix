@@ -40,6 +40,21 @@ export type Room = {
   send(content: string | { content: string }, opts?: SendOpts): Promise<Msg>;
 };
 
+/** A file event's `body` is its caption when `filename` is set and differs from
+ *  it; otherwise `body` is the filename (Matrix spec, MSC2530). The caption is
+ *  the user's whole message, however long, so it must not be read as a name. */
+export function splitFileBody(body: string, filename: unknown): { caption: string; filename: string } {
+  if (typeof filename === "string" && filename && filename !== body) return { caption: body, filename };
+  return { caption: "", filename: body || "attachment" };
+}
+
+/** Where to save an attachment. Both parts come from the sender, so only word
+ *  characters survive: a `/` in the extension would otherwise walk out of `dir`. */
+export function attachmentPath(dir: string, eventId: string, name: string): string {
+  const ext = path.extname(name).slice(1).replace(/[^\w]/g, "") || "bin";
+  return path.join(dir, `${eventId.replace(/[^\w]/g, "")}.${ext}`);
+}
+
 export type IncomingMessage = {
   id: string;
   roomId: string;
@@ -188,9 +203,12 @@ export class MatrixTransport {
         if (msgtype !== "m.text" && !isFile) return;
 
         const body: string = event.content.body ?? "";
+        const { caption, filename } = isFile
+          ? splitFileBody(body, event.content.filename)
+          : { caption: body, filename: "" };
         const attachments = isFile && event.content.url
           ? [{
-              name: body || "attachment",
+              name: filename,
               mxc: event.content.url as string,
               size: event.content.info?.size ?? 0,
             }]
@@ -208,7 +226,7 @@ export class MatrixTransport {
           threadRootId,
           sender: event.sender,
           senderName,
-          content: isFile ? "" : body,
+          content: caption,
           // No bot flag exists in Matrix. Absent an explicit list every sender
           // counts as human, so a room that admits siblings needs `humans` set
           // or a sibling could answer a confirmation.

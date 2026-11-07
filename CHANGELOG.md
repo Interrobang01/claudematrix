@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.11.0 - 2026-11-07
+
+### Fixed
+- **A message sent with an attachment lost its text.** A file event's `body` is
+  its caption when `filename` is set, and the gateway read it as the filename:
+  the message reached the model only as a "file extension", the part after its
+  last `.`, and everything before that was gone. The caption is now the
+  message, and the real filename names the file.
+- **The same parsing could write outside `tmp-attachments`.** A caption
+  containing `/../` walked the save path anywhere on disk. The extension is now
+  word characters only.
+- **Attachments were deleted when the turn ended,** while the session that was
+  told about them lived on. They are now kept for 14 days.
+- **An oversized or failed attachment vanished silently.** The turn is now told.
+- **A new thread was seeded with other threads.** With `replyInThread`, "recent
+  room history" for a top-level message was the roots of unrelated earlier
+  threads. A message that opens a thread now gets none.
+- **A missing attachments directory killed the gateway at startup.** It is now
+  logged, and the turn hears that the download failed.
+- A caption starting with `!` is not read as a command.
+
 ## 1.10.0 - 2026-10-29
 
 ### Added
