@@ -995,26 +995,68 @@ function localpart(mxid: string): string {
 }
 
 // Matrix has no command registry, so these are plain text prefixes.
-// `!new`, `!model`, `!cd`, `!sessions`, `!rooms` and `!reload-config` went in
-// 1.13.0: none had been used, a new top-level message is a new conversation,
-// and room-config.json hot-reloads.
+// Everything but `!help` acts on the thread it is typed in. At the top level
+// there is no conversation to act on (a top-level message opens a new one), so
+// they say so instead of answering "set" to nothing, as they did before 1.13.
 const TEXT_COMMANDS = [
   ["!help", "Show available commands"],
+  ["!new", "Clear this thread's context"],
+  ["!model <name>", "Switch this thread's model"],
+  ["!cd <path>", "Switch this thread's working directory"],
   ["!stop", "Kill this thread's running turn"],
 ] as const;
+const THREAD_COMMANDS = new Set(["!new", "!model", "!cd", "!stop"]);
 
 // --- Text commands ---
 
-async function handleCommand(msg: IncomingMessage, room: Room, threadId: string | null): Promise<boolean> {
-  const [cmd] = msg.content.trim().split(/\s+/);
+async function handleCommand(msg: IncomingMessage, room: Room, threadIdOrNull: string | null): Promise<boolean> {
+  const [cmd, ...rest] = msg.content.trim().split(/\s+/);
+  const arg = rest.join(" ").trim();
+  const agent = getRoomAgent(msg.roomId);
+  if (THREAD_COMMANDS.has(cmd) && !threadIdOrNull) {
+    await room.send(`*\`${cmd}\` acts on a conversation: use it inside the thread.*`);
+    return true;
+  }
+  const threadId = threadIdOrNull ?? "";
 
   switch (cmd) {
     case "!help":
       await room.send(TEXT_COMMANDS.map(([c, d]) => `\`${c}\` — ${d}`).join("\n"));
       return true;
 
+    case "!new": {
+      const entry = threadMap[threadId];
+      if (entry) {
+        const child = running.get(entry.sessionId);
+        if (child) child.kill("SIGTERM");
+        entry.sessionId = crypto.randomUUID();
+        entry.started = false;
+        saveEntry(threadId, entry);
+      }
+      await room.send("🆕 *Context cleared.*");
+      return true;
+    }
+
+    case "!model": {
+      if (!arg) { await room.send("Usage: `!model sonnet|opus|haiku`"); return true; }
+      const entry = getOrCreate(threadMap, threadId, agent?.workingDirectory ?? DEFAULT_CWD);
+      entry.model = arg;
+      saveEntry(threadId, entry);
+      await room.send(`🤖 *Model set to \`${arg}\` for this thread.*`);
+      return true;
+    }
+
+    case "!cd": {
+      if (!arg.startsWith("/")) { await room.send("Usage: `!cd /absolute/path`"); return true; }
+      if (!fs.existsSync(arg)) { await room.send(`No such directory: \`${arg}\``); return true; }
+      const entry = getOrCreate(threadMap, threadId, arg);
+      entry.cwd = arg;
+      saveEntry(threadId, entry);
+      await room.send(`📁 *Working directory set to \`${arg}\` for this thread.*`);
+      return true;
+    }
+
     case "!stop": {
-      if (!threadId) { await room.send("*`!stop` works inside the thread whose turn you want to stop.*"); return true; }
       const entry = threadMap[threadId];
       const child = entry && running.get(entry.sessionId);
       if (child) { child.kill("SIGTERM"); await room.send("🛑 *Stopped.*"); }

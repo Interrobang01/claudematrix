@@ -18,7 +18,7 @@ Originally [ecmulli/claudecord](https://github.com/ecmulli/claudecord), a Discor
 - **Attachments** — `mxc://` media downloaded and handed to Claude Code as files. A burst of top-level files plus text (how Sable sends several attachments) is one turn.
 - **Scheduled jobs** — cron agents that post into a room on a schedule.
 - **SQLite storage** — WAL, crash-safe session and bridge persistence.
-- **Commands** — `!help`, and `!stop` inside a thread to kill its running turn.
+- **Commands** — `!help`; inside a thread, `!new` (clear its context), `!model`, `!cd`, `!stop`.
 
 ## Quick start
 
