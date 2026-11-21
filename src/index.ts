@@ -750,6 +750,9 @@ type RoomSchedule = {
    *  conversation of its own. `{n}` is the firing's number, `{date}` its date
    *  in `timezone`. Ignored with `fresh`, which has no session to resume. */
   thread?: string;
+  /** Post only the run's last text block. Every block is posted otherwise, so
+   *  a job's "reading the feeds now" narration lands on top of its output. */
+  finalOnly?: boolean;
 };
 
 type SystemPromptMode = "append" | "replace";
@@ -1213,7 +1216,7 @@ function startScheduledJobs(): void {
         console.error(`[matrix-cc-bot] invalid cron for "${jobName}": ${cronExpr}`);
         continue;
       }
-      console.log(`[matrix-cc-bot] scheduling "${jobName}" → "${cronExpr}"${timezone ? ` (${timezone})` : ""}${job.fresh ? " fresh" : ""}${job.newTranscripts ? ` if-new:${job.newTranscripts}` : ""}${job.thread && !job.fresh ? " threaded" : ""}`);
+      console.log(`[matrix-cc-bot] scheduling "${jobName}" → "${cronExpr}"${timezone ? ` (${timezone})` : ""}${job.fresh ? " fresh" : ""}${job.newTranscripts ? ` if-new:${job.newTranscripts}` : ""}${job.thread && !job.fresh ? " threaded" : ""}${job.finalOnly ? " final-only" : ""}`);
 
       const task = cron.schedule(cronExpr, async () => {
         const runKey = `${roomId}:${job.name ?? cronExpr}`;
@@ -1258,6 +1261,7 @@ function startScheduledJobs(): void {
           const ok = await runTurn({
             room, roomId, threadId, entry, agent: cfg,
             prompt, replyTo: undefined, persist: job.fresh ? false : undefined,
+            finalOnly: job.finalOnly,
           });
           // A failed run leaves the mark where it was, so the next one rereads.
           if (ok) stmtRunPut.run(runKey, startedAt);
@@ -1445,6 +1449,7 @@ async function runTurn(opts: {
   prompt: string;
   replyTo?: Msg;
   persist?: boolean;
+  finalOnly?: boolean;
 }): Promise<boolean> {
   const { room, roomId, threadId, entry, agent, prompt, replyTo } = opts;
 
@@ -1553,7 +1558,7 @@ async function runTurn(opts: {
 
     // No retry on failure: a send that reached the server and lost its response
     // would post the answer twice. The error notice below says it failed.
-    const botReply = await sendChunked(room, result.text, replyTo);
+    const botReply = await sendChunked(room, opts.finalOnly ? result.finalText : result.text, replyTo);
 
     entry.lastBotMessageId = botReply.id;
     saveEntry(threadId, entry);
@@ -1578,7 +1583,60 @@ function applyRoomHumans(): void {
   }
 }
 
+// --- Bursts ---
+//
+// Clients send a message with several attachments as several events: Sable
+// posts each file, then the text, all top-level within a couple of seconds. In
+// a `replyInThread` room each one opened a thread with a cold session of its
+// own, so one request became three turns that knew nothing of each other.
+// A human's top-level bare file (no caption) is therefore held briefly; more
+// top-level events from the same sender join it, and the burst runs as one
+// message rooted at its first event. Anything with text ends a burst at once
+// (the text is what clients send last), and with nothing held is not delayed,
+// so a captioned single-event file or a plain message never waits.
+
+const BURST_QUIET_MS = 4_000;
+const BURST_MAX_MS = 15_000;
+type Burst = { msgs: IncomingMessage[]; timer: NodeJS.Timeout; started: number };
+const bursts = new Map<string, Burst>();
+
+function mergeBurst(msgs: IncomingMessage[]): IncomingMessage {
+  if (msgs.length === 1) return msgs[0];
+  const first = msgs[0];
+  return {
+    ...first,
+    content: msgs.map((m) => m.content.trim()).filter(Boolean).join("\n\n"),
+    attachments: msgs.flatMap((m) => m.attachments),
+    mentionsUs: msgs.some((m) => m.mentionsUs),
+  };
+}
+
+function flushBurst(key: string): void {
+  const b = bursts.get(key);
+  if (!b) return;
+  clearTimeout(b.timer);
+  bursts.delete(key);
+  if (b.msgs.length > 1) console.log(`[matrix-cc-bot] burst of ${b.msgs.length} events from ${b.msgs[0].sender} → one turn rooted at ${b.msgs[0].id.slice(0, 8)}…`);
+  void handleMessage(mergeBurst(b.msgs));
+}
+
 transport.onMessage(async (msg) => {
+  const agent = getRoomAgent(msg.roomId);
+  const burstable = msg.isHuman && !msg.threadRootId && (agent?.replyInThread ?? false);
+  if (!burstable) return handleMessage(msg);
+  const key = `${msg.roomId}\0${msg.sender}`;
+  const held = bursts.get(key);
+  const hasText = msg.content.trim() !== "";
+  if (!held && hasText) return handleMessage(msg);
+  const b = held ?? { msgs: [], timer: undefined as unknown as NodeJS.Timeout, started: Date.now() };
+  b.msgs.push(msg);
+  clearTimeout(b.timer);
+  bursts.set(key, b);
+  if (hasText || Date.now() - b.started >= BURST_MAX_MS) return flushBurst(key);
+  b.timer = setTimeout(() => flushBurst(key), BURST_QUIET_MS);
+});
+
+async function handleMessage(msg: IncomingMessage): Promise<void> {
   let releaseTurn: (() => void) | null = null;
   try {
     const agent = getRoomAgent(msg.roomId);
@@ -1779,7 +1837,7 @@ transport.onMessage(async (msg) => {
   } finally {
     releaseTurn?.();
   }
-});
+}
 
 // --- Start ---
 
