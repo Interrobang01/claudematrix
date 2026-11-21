@@ -44,7 +44,10 @@ room message → gating → session key → claude -p --resume <uuid> → messag
   prompt starting with `-` is parsed as an option.
 - **Deny rules survive `bypassPermissions`; allow rules do not.**
 - **`--session-id` must be a UUID**, and the CLI only says so when a turn runs.
-  Startup warns instead.
+  The gateway generates every one, so nothing user-supplied reaches it.
+- **Every conversation is a thread.** A top-level message opens one rooted at
+  itself; there are no room-level sessions (removed 1.13.0, unused since
+  threading went on everywhere).
 - **Addressing is not evidence.** The mention says who a message is *for* and is
   chosen by whoever wrote it. The `[name — an agent, not a human]` label says
   who *wrote* it and is put on by the gateway. Never merge them.
@@ -82,8 +85,7 @@ room message → gating → session key → claude -p --resume <uuid> → messag
   `filename` is set and differs. Attachment files outlive the turn (14 days),
   because the session that was told their path does.
 - **One request can arrive as several events.** Sable sends each attachment
-  as its own top-level event, then the text. In a `replyInThread` room a
-  human's bare top-level file is held (4 s quiet, 15 s cap) and the burst runs
+  as its own top-level event, then the text. A bare top-level file is held (4 s quiet, 15 s cap) and the burst runs
   as one message rooted at its first event; text ends a burst immediately and
   is never itself delayed. Without this each file opened its own cold thread.
 - **A scheduled job's silence is silent.** No `🤐` notice for cron runs, and

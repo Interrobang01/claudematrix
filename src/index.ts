@@ -218,14 +218,14 @@ function saveEntry(threadId: string, entry: ThreadEntry): void {
   });
 }
 
-function getOrCreate(map: ThreadMap, threadId: string, defaultCwd: string, seedSessionId?: string): ThreadEntry {
+function getOrCreate(map: ThreadMap, threadId: string, defaultCwd: string): ThreadEntry {
   if (!map[threadId]) {
     const row = stmtGet.get(threadId) as any;
     if (row) {
       map[threadId] = rowToEntry(row);
     } else {
       map[threadId] = {
-        sessionId: seedSessionId ?? crypto.randomUUID(),
+        sessionId: crypto.randomUUID(),
         cwd: defaultCwd,
         model: "opus",
         createdAt: Date.now(),
@@ -746,8 +746,7 @@ type RoomSchedule = {
   newTranscripts?: string;
   /** Post this as a top-level message and run the job inside its thread, so
    *  every reply to the post is in the thread and resumes the session. Without
-   *  it a reply to the post is top-level, and in a `replyInThread` room opens a
-   *  conversation of its own. `{n}` is the firing's number, `{date}` its date
+   *  it a reply to the post is top-level and opens a conversation of its own. `{n}` is the firing's number, `{date}` its date
    *  in `timezone`. Ignored with `fresh`, which has no session to resume. */
   thread?: string;
   /** Post only the run's last text block. Every block is posted otherwise, so
@@ -759,13 +758,11 @@ type SystemPromptMode = "append" | "replace";
 
 type RoomConfig = {
   name: string;
-  sessionId: string;
   systemPrompt?: string;
   systemPromptMode?: SystemPromptMode;
   workingDirectory?: string;
   model?: string;
   schedule?: RoomSchedule | RoomSchedule[];
-  contextFile?: string;
   /** Answer only when mentioned. Default false — a configured room replies to everything. */
   requireMention?: boolean;
   /** Extra case-insensitive regexes counted as a mention, so a bare name in plain
@@ -795,10 +792,6 @@ type RoomConfig = {
   relayRoom?: string;
   /** Prepend recent room messages to the prompt. Default true. */
   fetchHistory?: boolean;
-  /** Rooms sharing a group share one Claude Code session, so a conversation can
-   *  move between rooms without starting over. Give them the same `sessionId` too;
-   *  otherwise whichever room speaks first seeds the group. */
-  sessionGroup?: string;
   /** Withheld from the model via --disallowed-tools. Names, not an allowlist, so a
    *  tool that becomes available later cannot appear in a turn by surprise; and a
    *  flag rather than a deny rule, so the schema stays out of the prompt too. */
@@ -812,13 +805,6 @@ type RoomConfig = {
   /** Minutes before a sibling's silence wakes the sender of a `message` that
    *  expects an answer. Default 5. */
   replyTimeoutMinutes?: number;
-  /** Start a thread on every top-level message here, so each exchange gets its
-   *  own bounded session. Off by default, which leaves the room behaving exactly
-   *  as it did: threads are then opt-in, and a human starts one by hand to get
-   *  a fresh context. A message *inside* a thread gets its own session
-   *  either way — that does not need enabling, because it cannot happen by
-   *  accident. */
-  replyInThread?: boolean;
 };
 
 type RoomConfigFile = {
@@ -832,11 +818,6 @@ type RoomConfigFile = {
   };
   /** MXIDs treated as human in every room lacking its own `humans` list. */
   defaultHumans?: string[];
-  /** Ignore mentions in rooms that have no entry above. Default false, which is
-   *  upstream's behaviour: a mention anywhere the bot can see starts a turn with
-   *  DEFAULT_CWD, the generic prompt, and none of a room's tool
-   *  denials. Where the room list is a containment boundary, set this true. */
-  configuredRoomsOnly?: boolean;
 };
 
 // The startup line says whether it loaded, because a config that silently did
@@ -858,14 +839,8 @@ function loadRoomConfig(): RoomConfigFile {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("top level is not an object");
   const rooms = raw.rooms ?? raw.channels ?? {};
   if (!rooms || typeof rooms !== "object" || Array.isArray(rooms)) throw new Error("`rooms` is not an object");
-  // `channels` and `configuredChannelsOnly` are what the Discord-era config
-  // called these. The file is gitignored, so a deployment's copy can only be
-  // renamed by hand; both spellings load.
-  return {
-    ...raw,
-    rooms,
-    configuredRoomsOnly: raw.configuredRoomsOnly ?? raw.configuredChannelsOnly ?? false,
-  };
+  // `channels` is what the Discord-era config called `rooms`; both load.
+  return { ...raw, rooms };
 }
 
 /** Reload, keeping the previous config if the new file is bad. */
@@ -888,64 +863,8 @@ try {
 }
 
 
-// --- Context File Cache ---
+// --- Config hot reload ---
 
-const contextFileCache = new Map<string, string>();
-
-function loadContextFile(filePath: string): string {
-  const absPath = path.resolve(path.join(import.meta.dirname, "..", filePath));
-  try {
-    const content = fs.readFileSync(absPath, "utf8").trim();
-    contextFileCache.set(filePath, content);
-    console.log(`[matrix-cc-bot] loaded context file: ${filePath}`);
-    return content;
-  } catch (err) {
-    console.error(`[matrix-cc-bot] failed to load context file "${filePath}":`, (err as Error).message);
-    return "";
-  }
-}
-
-function getContextForRoom(config: RoomConfig): string {
-  if (!config.contextFile) return "";
-  if (contextFileCache.has(config.contextFile)) {
-    return contextFileCache.get(config.contextFile)!;
-  }
-  return loadContextFile(config.contextFile);
-}
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-// `--session-id` must be a valid UUID. A bad one fails only on the room's
-// very first turn, which is a long way from where it was configured.
-function warnOnBadSessionIds(): void {
-  const groups = new Map<string, Set<string>>();
-  for (const [cid, cfg] of Object.entries(roomConfig.rooms)) {
-    if (!UUID_RE.test(cfg.sessionId)) {
-      console.error(`[matrix-cc-bot] room ${cid} ("${cfg.name}") has sessionId "${cfg.sessionId}", which is not a UUID — its first turn will fail.`);
-    }
-    if (cfg.sessionGroup) {
-      if (!groups.has(cfg.sessionGroup)) groups.set(cfg.sessionGroup, new Set());
-      groups.get(cfg.sessionGroup)!.add(cfg.sessionId);
-    }
-  }
-  for (const [name, ids] of groups) {
-    if (ids.size > 1) {
-      console.error(`[matrix-cc-bot] sessionGroup "${name}" spans ${ids.size} different sessionIds — whichever room speaks first seeds the group and the rest are ignored.`);
-    }
-  }
-}
-
-function preloadContextFiles(): void {
-  contextFileCache.clear();
-  for (const cfg of Object.values(roomConfig.rooms)) {
-    if (cfg.contextFile) {
-      loadContextFile(cfg.contextFile);
-    }
-  }
-}
-
-preloadContextFiles();
-warnOnBadSessionIds();
 
 // Watch for config changes and reload
 fs.watchFile(CONFIG_PATH, { interval: 5000 }, (curr) => {
@@ -953,11 +872,9 @@ fs.watchFile(CONFIG_PATH, { interval: 5000 }, (curr) => {
   if (curr.mtimeMs === 0) return;
   console.log(`[matrix-cc-bot] reloading ${path.basename(CONFIG_PATH)}`);
   if (!reloadRoomConfig()) return;
-  preloadContextFiles();
-  warnOnBadSessionIds();
-  // Everything `!reload-config` does. The `humans` lists and the schedules are
-  // pushed into the transport and the cron at load time, so before this an
-  // edit to either silently did nothing until a restart.
+  // The `humans` lists and the schedules are pushed into the transport and the
+  // cron at load time, so without this an edit to either did nothing until a
+  // restart.
   applyRoomHumans();
   startScheduledJobs();
 });
@@ -966,20 +883,13 @@ function getRoomAgent(roomId: string): RoomConfig | null {
   return roomConfig.rooms[roomId] ?? null;
 }
 
-// Which row a turn's session lives under. Rooms sharing a `sessionGroup` share
-// one session: an agent working in the shared room can ask for a confirmation on its
-// private room and the same session sees the answer, which is what keeps the
-// private room meaningful instead of merely quieter.
-//
-// A thread overrides the group and gets a session of its own. That is the point
-// of threading a conversation — a bounded context you clear by starting another
-// one — but note what it costs: a thread lives in exactly one room, so an
-// exchange threaded in the shared room can no longer ask for confirmation in the
-// agent's private room and see the answer. Top-level traffic keeps the group and
-// keeps that property. Thread deliberately.
-function sessionKey(roomId: string, agent: RoomConfig | null, threadRootId?: string): string {
-  if (threadRootId) return `thread:${threadRootId}`;
-  return agent?.sessionGroup ? `group:${agent.sessionGroup}` : roomId;
+// Every conversation is a thread: a top-level message opens one rooted at
+// itself, and its session lives under that root. Room-level sessions
+// (`sessionGroup`, a room's `sessionId`) went in 1.13.0; no room had used one
+// since every room turned on threading, and top-level commands that changed
+// them answered "set" and changed nothing.
+function sessionKey(threadRootId: string): string {
+  return `thread:${threadRootId}`;
 }
 
 function resolveSystemPromptMode(agent: RoomConfig | null): SystemPromptMode {
@@ -1085,62 +995,26 @@ function localpart(mxid: string): string {
 }
 
 // Matrix has no command registry, so these are plain text prefixes.
+// `!new`, `!model`, `!cd`, `!sessions`, `!rooms` and `!reload-config` went in
+// 1.13.0: none had been used, a new top-level message is a new conversation,
+// and room-config.json hot-reloads.
 const TEXT_COMMANDS = [
   ["!help", "Show available commands"],
-  ["!new", "Clear context — start a new conversation"],
-  ["!model <name>", "Switch Claude model"],
-  ["!cd <path>", "Switch working directory"],
-  ["!stop", "Kill running Claude process"],
-  ["!sessions", "List all active sessions"],
-  ["!rooms", "List configured room agents"],
-  ["!reload-config", "Reload the room config"],
+  ["!stop", "Kill this thread's running turn"],
 ] as const;
 
 // --- Text commands ---
 
-async function handleCommand(msg: IncomingMessage, room: Room, threadId: string): Promise<boolean> {
-  const [cmd, ...rest] = msg.content.trim().split(/\s+/);
-  const arg = rest.join(" ").trim();
-  const agent = getRoomAgent(msg.roomId);
+async function handleCommand(msg: IncomingMessage, room: Room, threadId: string | null): Promise<boolean> {
+  const [cmd] = msg.content.trim().split(/\s+/);
 
   switch (cmd) {
     case "!help":
       await room.send(TEXT_COMMANDS.map(([c, d]) => `\`${c}\` — ${d}`).join("\n"));
       return true;
 
-    case "!new": {
-      const entry = threadMap[threadId];
-      if (entry) {
-        const child = running.get(entry.sessionId);
-        if (child) child.kill("SIGTERM");
-        entry.sessionId = crypto.randomUUID();
-        entry.started = false;
-        saveEntry(threadId, entry);
-      }
-      await room.send("🆕 *Context cleared.*");
-      return true;
-    }
-
-    case "!model": {
-      if (!arg) { await room.send("Usage: `!model sonnet|opus|haiku`"); return true; }
-      const entry = getOrCreate(threadMap, threadId, agent?.workingDirectory ?? DEFAULT_CWD);
-      entry.model = arg;
-      saveEntry(threadId, entry);
-      await room.send(`🤖 *Model set to \`${arg}\`.*`);
-      return true;
-    }
-
-    case "!cd": {
-      if (!arg.startsWith("/")) { await room.send("Usage: `!cd /absolute/path`"); return true; }
-      if (!fs.existsSync(arg)) { await room.send(`No such directory: \`${arg}\``); return true; }
-      const entry = getOrCreate(threadMap, threadId, arg);
-      entry.cwd = arg;
-      saveEntry(threadId, entry);
-      await room.send(`📁 *Working directory set to \`${arg}\`.*`);
-      return true;
-    }
-
     case "!stop": {
+      if (!threadId) { await room.send("*`!stop` works inside the thread whose turn you want to stop.*"); return true; }
       const entry = threadMap[threadId];
       const child = entry && running.get(entry.sessionId);
       if (child) { child.kill("SIGTERM"); await room.send("🛑 *Stopped.*"); }
@@ -1148,31 +1022,6 @@ async function handleCommand(msg: IncomingMessage, room: Room, threadId: string)
       return true;
     }
 
-    case "!sessions": {
-      const lines = Object.entries(threadMap).map(([k, e]) =>
-        `\`${k}\` — ${e.sessionId.slice(0, 8)} ${e.model ?? "?"} ${running.has(e.sessionId) ? "▶︎" : ""}`);
-      await room.send(lines.length ? lines.join("\n") : "*No sessions.*");
-      return true;
-    }
-
-    case "!rooms": {
-      const lines = Object.entries(roomConfig.rooms).map(([rid, c]) =>
-        `**${c.name}** \`${rid}\`${c.sessionGroup ? ` group:${c.sessionGroup}` : ""}${c.requireMention ? " mention" : ""}`);
-      await room.send(lines.length ? lines.join("\n") : "*No configured rooms.*");
-      return true;
-    }
-
-    case "!reload-config":
-      if (!reloadRoomConfig()) {
-        await room.send("⚠️ *room-config.json is invalid — kept the previous config. See the log.*");
-        return true;
-      }
-      preloadContextFiles();
-      warnOnBadSessionIds();
-      applyRoomHumans();
-      startScheduledJobs();
-      await room.send(`♻️ *Reloaded — ${Object.keys(roomConfig.rooms).length} room(s).*`);
-      return true;
   }
   return false;
 }
@@ -1265,13 +1114,6 @@ function startScheduledJobs(): void {
           });
           // A failed run leaves the mark where it was, so the next one rereads.
           if (ok) stmtRunPut.run(runKey, startedAt);
-          // Without `thread`, what the run posted is a top-level message, and a
-          // reply in its thread should continue the conversation that wrote it
-          // rather than meet it cold. A reply *to* it is not in its thread, and
-          // does not reach this; `thread` is the fix for that.
-          if (ok && !job.fresh && !job.thread && entry.lastBotMessageId) {
-            moveEntry(threadId, `thread:${entry.lastBotMessageId}`);
-          }
         } catch (err) {
           console.error(`[matrix-cc-bot] cron error for ${jobName}:`, (err as Error).message);
         } finally {
@@ -1465,10 +1307,7 @@ async function runTurn(opts: {
   const typing = setInterval(() => { transport.setTyping(roomId, true); }, 20_000);
 
   const baseSystemPrompt = agent?.systemPrompt ?? roomConfig.defaults?.systemPrompt ?? SYSTEM_PROMPT;
-  const roomContext = agent ? getContextForRoom(agent) : "";
-  const systemPrompt = roomContext
-    ? `Room context:\n${roomContext}\n\n${baseSystemPrompt}`
-    : baseSystemPrompt;
+  const systemPrompt = baseSystemPrompt;
 
   // The `message` tool, wherever this conversation can reach a sibling.
   const turnToken = crypto.randomUUID();
@@ -1590,7 +1429,7 @@ function applyRoomHumans(): void {
 //
 // Clients send a message with several attachments as several events: Sable
 // posts each file, then the text, all top-level within a couple of seconds. In
-// a `replyInThread` room each one opened a thread with a cold session of its
+// an agent's room each one opened a thread with a cold session of its
 // own, so one request became three turns that knew nothing of each other.
 // A human's top-level bare file (no caption) is therefore held briefly; more
 // top-level events from the same sender join it, and the burst runs as one
@@ -1625,7 +1464,7 @@ function flushBurst(key: string): void {
 
 transport.onMessage(async (msg) => {
   const agent = getRoomAgent(msg.roomId);
-  const burstable = msg.isHuman && !msg.threadRootId && (agent?.replyInThread ?? false);
+  const burstable = !!agent && msg.isHuman && !msg.threadRootId;
   if (!burstable) return handleMessage(msg);
   const key = `${msg.roomId}\0${msg.sender}`;
   const held = bursts.get(key);
@@ -1667,18 +1506,13 @@ async function handleMessage(msg: IncomingMessage): Promise<void> {
     // 1.1.0 routed a sibling's unaddressed message home too, but a bridge row
     // lives as long as its thread, so once a human joined the thread the
     // sibling's answers *to them* went home as well.
-    if (agent) {
-      if ((agent.requireMention ?? false) && !isMentioned) return;
-    } else if (isMentioned) {
-      // A mention in a room with no config. Whether that is a feature or a hole
-      // in a boundary depends on the deployment, so it is a setting.
-      if (roomConfig.configuredRoomsOnly) {
-        console.log(`[matrix-cc-bot] mention in unconfigured room ${msg.roomId} — ignored (configuredRoomsOnly)`);
-        return;
-      }
-    } else {
+    // Only configured rooms are answered: the room list is a containment
+    // boundary (it is what carries each room's tool denials and humans list).
+    if (!agent) {
+      if (isMentioned) console.log(`[matrix-cc-bot] mention in unconfigured room ${msg.roomId} — ignored`);
       return;
     }
+    if ((agent.requireMention ?? false) && !isMentioned) return;
 
     // An answer from somebody this conversation is waiting on settles the wait.
     if (fromBot && msg.threadRootId) stmtPendingClear.run(msg.threadRootId, localpart(msg.sender));
@@ -1690,15 +1524,14 @@ async function handleMessage(msg: IncomingMessage): Promise<void> {
 
     // Commands are free: no turn, no spend.
     if (msg.isHuman && msg.attachments.length === 0 && msg.content.trim().startsWith("!")) {
-      if (await handleCommand(msg, room, sessionKey(msg.roomId, agent, inThread))) return;
+      if (await handleCommand(msg, room, inThread ? sessionKey(inThread) : null)) return;
     }
 
     const content = msg.content.trim();
     if (!content && msg.attachments.length === 0) return;
 
-    // A message already in a thread stays there. A top-level message opens one
-    // only where the room asks for it.
-    const outThread = inThread ?? ((agent?.replyInThread ?? false) ? msg.id : undefined);
+    // A message already in a thread stays there. A top-level message opens one.
+    const outThread = inThread ?? msg.id;
 
     // An answer to something this agent relayed. It arrived in the shared room,
     // but it belongs to the conversation that asked for it, so the turn runs in
@@ -1715,7 +1548,7 @@ async function handleMessage(msg: IncomingMessage): Promise<void> {
     const turnThreadRoot = routed ? (routed.homeThreadRootId ?? undefined) : outThread;
     const turnRoom = transport.room(turnRoomId, turnThreadRoot);
 
-    const threadId = routed ? routed.homeThreadId : sessionKey(msg.roomId, agent, outThread);
+    const threadId = routed ? routed.homeThreadId : sessionKey(outThread);
     // Tool denials and the working directory follow the conversation, not the
     // room the message happened to arrive in.
     const turnAgent = routed ? getRoomAgent(routed.homeRoomId) : agent;
@@ -1729,16 +1562,9 @@ async function handleMessage(msg: IncomingMessage): Promise<void> {
       }
     }
 
-    // Only a room-level session may be seeded from the configured `sessionId`.
-    // Seeding a thread with it would make every new thread resume the one
-    // long-lived session it was supposed to be an escape from.
-    // The room's model and directory are where a conversation starts, not a
-    // setting it is held to: overwriting them every turn made `!model` and `!cd`
-    // answer "set" and then do nothing.
+    // The room's model and directory are where a conversation starts.
     const isNew = !threadMap[threadId] && !stmtGet.get(threadId);
-    const entry = turnAgent
-      ? getOrCreate(threadMap, threadId, agentCwd, (routed || outThread) ? undefined : turnAgent.sessionId)
-      : getOrCreate(threadMap, threadId, DEFAULT_CWD);
+    const entry = getOrCreate(threadMap, threadId, agentCwd);
     if (turnAgent && isNew) { entry.cwd = agentCwd; entry.model = agentModel; saveEntry(threadId, entry); }
 
     // A confirmation is on screen in this session and has not been answered.
@@ -1874,11 +1700,11 @@ process.on("SIGTERM", shutdown);
   console.log(
     configured.length
       ? `[matrix-cc-bot] ${configured.length} room(s) from ${path.basename(configPath()!)}: ` + configured
-          .map(([rid, c]) => `${c.name}=${rid}${c.sessionGroup ? ` group:${c.sessionGroup}` : ""}${c.requireMention ? " mention" : ""}${c.allowBots ? " bots" : ""}${c.fetchHistory === false ? " nohistory" : ""}${c.replyInThread ? " thread" : ""}${c.relayRoom ? " relay" : ""}${c.disallowedTools?.length ? ` -${c.disallowedTools.length}tools` : ""}`)
+          .map(([rid, c]) => `${c.name}=${rid}${c.requireMention ? " mention" : ""}${c.allowBots ? " bots" : ""}${c.fetchHistory === false ? " nohistory" : ""}${c.relayRoom ? " relay" : ""}${c.disallowedTools?.length ? ` -${c.disallowedTools.length}tools` : ""}`)
           .join(", ")
-      : "[matrix-cc-bot] no room-config.json — mention-only with defaults",
+      : "[matrix-cc-bot] no room-config.json — nothing will be answered",
   );
-  console.log(`[matrix-cc-bot] unconfigured rooms: ${roomConfig.configuredRoomsOnly ? "ignored" : "answer on mention with defaults"}`);
+  console.log(`[matrix-cc-bot] unconfigured rooms: ignored`);
   console.log(`[matrix-cc-bot] backfill: events before startup are dropped`);
 
   startScheduledJobs();
