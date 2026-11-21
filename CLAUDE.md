@@ -81,6 +81,13 @@ room message → gating → session key → claude -p --resume <uuid> → messag
 - **A file event's `body` may be the whole message.** It is a caption when
   `filename` is set and differs. Attachment files outlive the turn (14 days),
   because the session that was told their path does.
+- **One request can arrive as several events.** Sable sends each attachment
+  as its own top-level event, then the text. In a `replyInThread` room a
+  human's bare top-level file is held (4 s quiet, 15 s cap) and the burst runs
+  as one message rooted at its first event; text ends a burst immediately and
+  is never itself delayed. Without this each file opened its own cold thread.
+- **A scheduled job's silence is silent.** No `🤐` notice for cron runs, and
+  `finalOnly` jobs post only the last text block, so narration stays out.
 - **Verify behaviour, not the config value.** This codebase has a history of
   keys that were read by nothing (`replyInThread` sat inert in the config for
   months) and of configs that silently failed to load. New config keys need a

@@ -1261,7 +1261,7 @@ function startScheduledJobs(): void {
           const ok = await runTurn({
             room, roomId, threadId, entry, agent: cfg,
             prompt, replyTo: undefined, persist: job.fresh ? false : undefined,
-            finalOnly: job.finalOnly,
+            finalOnly: job.finalOnly, scheduled: true,
           });
           // A failed run leaves the mark where it was, so the next one rereads.
           if (ok) stmtRunPut.run(runKey, startedAt);
@@ -1450,6 +1450,9 @@ async function runTurn(opts: {
   replyTo?: Msg;
   persist?: boolean;
   finalOnly?: boolean;
+  /** A cron run. Its silence posts nothing: nobody is waiting on it, and a
+   *  daily "no response" notice in every room was litter. */
+  scheduled?: boolean;
 }): Promise<boolean> {
   const { room, roomId, threadId, entry, agent, prompt, replyTo } = opts;
 
@@ -1547,7 +1550,7 @@ async function runTurn(opts: {
     const lines = result.finalText.trim().split("\n");
     if (lines[0].trim() === SILENT_TOKEN || lines[lines.length - 1].trim() === SILENT_TOKEN) {
       const notice = `🤐 *${selfName}: no response*`;
-      await (replyTo ? replyTo.reply(notice, { notice: true }) : room.send(notice, { notice: true })).catch(() => {});
+      if (!opts.scheduled) await (replyTo ? replyTo.reply(notice, { notice: true }) : room.send(notice, { notice: true })).catch(() => {});
       entry.started = true;
       saveEntry(threadId, entry);
       console.log(`[matrix-cc-bot] ${SILENT_TOKEN} in ${threadId} — nothing posted`);
