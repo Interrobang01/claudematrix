@@ -11,6 +11,7 @@ Originally [ecmulli/claudecord](https://github.com/ecmulli/claudecord), a Discor
 - **Room routing** — map Matrix room IDs to agents in `room-config.json` (hot-reloaded). Each room has its own cwd, model, system prompt and tool denials.
 - **Thread sessions** — every conversation is a thread with its own session: a top-level message opens one, so clearing context is just starting a new message.
 - **Sibling messaging** — an agent reaches another with the `message` tool. The text is posted into the shared room, the answer is routed back to the thread that asked, and if none comes the sender is woken once after a timeout. See [Addressing](#addressing).
+- **`wake_me`** — an agent can resume its own thread later (1 min to a week), durable across restarts. Claude Code's in-process schedulers (`CronCreate`, `ScheduleWakeup`, …) are withheld, since a turn's process exits when the turn does.
 - **Speaker labels** — who spoke is a label the gateway adds, who a message is for is a mention, and the two are never merged.
 - **`humans`** — Matrix has no bot flag, so an explicit MXID list per room is the whole distinction. It is also the only thing that can answer a confirmation.
 - **Confirmations** — `AskUserQuestion` renders as a numbered list and blocks the session until somebody on the `humans` list answers.

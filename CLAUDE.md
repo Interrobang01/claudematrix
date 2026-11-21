@@ -55,6 +55,11 @@ room message → gating → session key → claude -p --resume <uuid> → messag
   wake: the answer, or one gateway turn at the deadline. The deadline lives in
   SQLite so a restart keeps it. Do not add acknowledgements from the recipient;
   that is how you end up needing infinitely many.
+- **`wake_me` is the only scheduler a turn has.** Claude Code's own
+  (`CronCreate`, `ScheduleWakeup`) live in the process, which exits with the
+  turn, so they accept a job and drop it; the gateway withholds them in every
+  turn. Background Bash does wake a `-p` process, but the gateway posts only
+  at exit, holds the thread's lane, and kills the process at 90 min.
 - **`mcp-siblings.mjs` is plain JS.** The CLI starts it with the agent's
   workspace as cwd, where tsx does not resolve, and Node 22 does not strip types.
 - **`humans` is the trust boundary**, not the room. A confirmation blocks its

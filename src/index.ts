@@ -124,6 +124,19 @@ const stmtHeldTake = db.prepare("DELETE FROM held WHERE threadId = ? RETURNING t
 const stmtPendingClaim = db.prepare(
   "DELETE FROM pending WHERE homeThreadId = ? AND toName = ? AND deadline <= ?");
 const stmtPendingDue = db.prepare("SELECT * FROM pending WHERE deadline <= ? ORDER BY deadline");
+// Wakes a conversation set for itself with `wake_me`. A row is deleted when it
+// fires, so a restart neither loses nor repeats one.
+db.exec(`CREATE TABLE IF NOT EXISTS wakes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, roomId TEXT NOT NULL, threadRootId TEXT NOT NULL,
+  threadId TEXT NOT NULL, note TEXT NOT NULL, setAt INTEGER NOT NULL, due INTEGER NOT NULL
+)`);
+const stmtWakePut = db.prepare(
+  "INSERT INTO wakes (roomId, threadRootId, threadId, note, setAt, due) VALUES (@roomId, @threadRootId, @threadId, @note, @setAt, @due)");
+const stmtWakeCount = db.prepare("SELECT count(*) AS n FROM wakes WHERE threadId = ?");
+const stmtWakeDue = db.prepare("SELECT * FROM wakes WHERE due <= ? ORDER BY due");
+const stmtWakeClaim = db.prepare("DELETE FROM wakes WHERE id = ?");
+type Wake = { id: number; roomId: string; threadRootId: string; threadId: string; note: string; setAt: number; due: number };
+const MAX_WAKES_PER_THREAD = 5;
 
 db.exec("CREATE TABLE IF NOT EXISTS schedule_runs (key TEXT PRIMARY KEY, lastRun INTEGER NOT NULL)");
 const stmtRunGet = db.prepare("SELECT lastRun FROM schedule_runs WHERE key = ?");
@@ -1179,6 +1192,7 @@ const turnTokens = new Map<string, TurnCtx>();
 let siblingsUrl = "";
 const SIBLINGS_SERVER = path.join(import.meta.dirname, "mcp-siblings.mjs");
 const DEFAULT_REPLY_TIMEOUT_MIN = 5;
+const IN_PROCESS_SCHEDULERS = ["CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "RemoteTrigger"];
 
 function replyTimeoutMs(agent: RoomConfig | null): number {
   return (agent?.replyTimeoutMinutes ?? roomConfig.defaults?.replyTimeoutMinutes ?? DEFAULT_REPLY_TIMEOUT_MIN) * 60_000;
@@ -1243,23 +1257,70 @@ async function sendToSibling(ctx: TurnCtx, to: string, text: string, expectReply
   return `Posted to ${to}. Your turn can end now: you will be woken by their answer, or once at ${clock(deadline)} if none comes.`;
 }
 
+/** `wake_me`: a row that `fireWakes` turns into a turn in this thread later. */
+function setWake(ctx: TurnCtx, minutes: number, note: string): string {
+  if (!ctx.threadId.startsWith("thread:")) throw new Error("this conversation is not a thread, so there is nothing to resume");
+  if (!Number.isFinite(minutes) || minutes < 1 || minutes > 10080) throw new Error("minutes must be between 1 and 10080");
+  if (!note.trim()) throw new Error("the note is empty; say what to do when woken");
+  if ((stmtWakeCount.get(ctx.threadId) as { n: number }).n >= MAX_WAKES_PER_THREAD) {
+    throw new Error(`this thread already has ${MAX_WAKES_PER_THREAD} wakes pending`);
+  }
+  const now = Date.now();
+  const due = now + Math.round(minutes * 60_000);
+  stmtWakePut.run({ roomId: ctx.roomId, threadRootId: ctx.threadId.slice(7), threadId: ctx.threadId, note: note.trim(), setAt: now, due });
+  console.log(`[matrix-cc-bot] wake set for ${ctx.threadId} in ${minutes} min`);
+  const when = new Date(due).toLocaleString("en-US", { timeZone: "America/Los_Angeles", weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false });
+  return `Set. This thread will be resumed at ${when} Pacific (in ${minutes} min) with your note. Your turn can end now.`;
+}
+
+const wakeFiring = new Set<number>();
+async function fireWakes(): Promise<void> {
+  for (const w of stmtWakeDue.all(Date.now()) as Wake[]) {
+    if (wakeFiring.has(w.id)) continue;
+    wakeFiring.add(w.id);
+    (async () => {
+      const release = await acquireTurn(w.threadId);
+      try {
+        if (stmtWakeClaim.run(w.id).changes === 0) return;
+        const agent = getRoomAgent(w.roomId);
+        const cwd = agent?.workingDirectory ?? roomConfig.defaults?.workingDirectory ?? DEFAULT_CWD;
+        const entry = getOrCreate(threadMap, w.threadId, cwd);
+        const room = transport.room(w.roomId, w.threadRootId);
+        console.log(`[matrix-cc-bot] wake firing for ${w.threadId}`);
+        if (entry.awaitingAnswer) {
+          await room.send(`*A wake-up you set fired, but this conversation is waiting on a confirmation. Note: ${w.note}*`, { notice: true }).catch(() => {});
+          return;
+        }
+        await runTurn({
+          room, roomId: w.roomId, threadId: w.threadId, entry, agent,
+          prompt: `[gateway] The wake-up you set at ${clock(w.setAt)} (${Math.round((w.due - w.setAt) / 60_000)} min ago). Your note: ${w.note}`,
+        });
+      } finally {
+        release();
+        wakeFiring.delete(w.id);
+      }
+    })().catch((err) => console.error("[matrix-cc-bot] wake failed:", (err as Error).message));
+  }
+}
+
 function startSiblingsEndpoint(): Promise<void> {
   const server = http.createServer((req, res) => {
     const reply = (code: number, body: object) => {
       res.writeHead(code, { "content-type": "application/json" });
       res.end(JSON.stringify(body));
     };
-    if (req.method !== "POST" || req.url !== "/message") return reply(404, { error: "not found" });
+    if (req.method !== "POST" || (req.url !== "/message" && req.url !== "/wake")) return reply(404, { error: "not found" });
     let raw = "";
     req.on("data", (c) => { raw += c; if (raw.length > 1_000_000) req.destroy(); });
     req.on("end", async () => {
       try {
-        const { token, to, text, expect_reply } = JSON.parse(raw);
+        const { token, to, text, expect_reply, minutes, note } = JSON.parse(raw);
         const ctx = turnTokens.get(token);
-        if (!ctx) return reply(403, { error: "Not sent: this turn is no longer running." });
+        if (!ctx) return reply(403, { error: "Not done: this turn is no longer running." });
+        if (req.url === "/wake") return reply(200, { result: setWake(ctx, Number(minutes), String(note ?? "")) });
         reply(200, { result: await sendToSibling(ctx, String(to ?? ""), String(text ?? ""), expect_reply !== false) });
       } catch (err) {
-        reply(200, { error: `Not sent: ${(err as Error).message}` });
+        reply(200, { error: `Not ${req.url === "/wake" ? "set" : "sent"}: ${(err as Error).message}` });
       }
     });
   });
@@ -1270,11 +1331,11 @@ function startSiblingsEndpoint(): Promise<void> {
 }
 
 /** The per-turn `--mcp-config` that gives a turn the `message` tool. */
-function siblingsMcpConfig(token: string): string {
-  return JSON.stringify({ mcpServers: { siblings: {
+function siblingsMcpConfig(token: string, canMessage: boolean): string {
+  return JSON.stringify({ mcpServers: { gateway: {
     command: process.execPath,
     args: [SIBLINGS_SERVER],
-    env: { SIBLINGS_URL: siblingsUrl, SIBLINGS_TOKEN: token },
+    env: { SIBLINGS_URL: siblingsUrl, SIBLINGS_TOKEN: token, SIBLINGS_CAN_MESSAGE: canMessage ? "1" : "0" },
   } } });
 }
 
@@ -1351,13 +1412,15 @@ async function runTurn(opts: {
   const baseSystemPrompt = agent?.systemPrompt ?? roomConfig.defaults?.systemPrompt ?? SYSTEM_PROMPT;
   const systemPrompt = baseSystemPrompt;
 
-  // The `message` tool, wherever this conversation can reach a sibling.
+  // The gateway's tools: `message` wherever this conversation can reach a
+  // sibling, and `wake_me` in every thread.
   const turnToken = crypto.randomUUID();
   const canMessage = !!siblingsUrl && (!!agent?.relayRoom || (agent?.allowBots ?? false));
-  if (canMessage) turnTokens.set(turnToken, { roomId, threadId, agent });
+  const gatewayTools = !!siblingsUrl && (canMessage || threadId.startsWith("thread:"));
+  if (gatewayTools) turnTokens.set(turnToken, { roomId, threadId, agent });
   const mcpConfigs = [
     ...(agent?.mcpConfig ? [agent.mcpConfig] : []),
-    ...(canMessage ? [siblingsMcpConfig(turnToken)] : []),
+    ...(gatewayTools ? [siblingsMcpConfig(turnToken, canMessage)] : []),
   ];
 
   const runOpts = {
@@ -1368,7 +1431,10 @@ async function runTurn(opts: {
     claudeBin: CLAUDE_BIN,
     systemPrompt,
     systemPromptMode: resolveSystemPromptMode(agent),
-    disallowedTools: agent?.disallowedTools,
+    // Claude Code's own schedulers live in the process, and a turn's process
+    // exits when the turn ends, so they would accept a job and silently drop it.
+    // `wake_me` is the durable one.
+    disallowedTools: [...(agent?.disallowedTools ?? []), ...IN_PROCESS_SCHEDULERS],
     mcpConfigs,
     persist: opts.persist,
     callbacks: {
@@ -1736,7 +1802,10 @@ process.on("SIGTERM", shutdown);
 
   applyRoomHumans();
   await startSiblingsEndpoint();
-  setInterval(() => { firePendingDeadlines().catch((err) => console.error("[matrix-cc-bot] deadline check failed:", (err as Error).message)); }, 30_000);
+  setInterval(() => {
+    firePendingDeadlines().catch((err) => console.error("[matrix-cc-bot] deadline check failed:", (err as Error).message));
+    fireWakes().catch((err) => console.error("[matrix-cc-bot] wake check failed:", (err as Error).message));
+  }, 30_000);
   console.log(`[matrix-cc-bot] message tool on ${siblingsUrl}; reply timeout ${roomConfig.defaults?.replyTimeoutMinutes ?? DEFAULT_REPLY_TIMEOUT_MIN} min by default`);
   const configured = Object.entries(roomConfig.rooms);
   console.log(
